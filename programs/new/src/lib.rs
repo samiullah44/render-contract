@@ -1,203 +1,139 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, TokenInterface, TokenAccount, Mint, TransferChecked};
-use std::str::FromStr;
+use anchor_spl::associated_token::AssociatedToken;
 
 declare_id!("6SFP2GgBKFdakXKMZz4PrV8nyWnaMsS5mSN2YehApCgp");
-
-const RNDR_MINT: &str = "2PdTeB2ac5hf2V17Guq1Kb7YAU7mGeZPSnYgYAxvNPs1";
 
 #[program]
 pub mod render_network {
     use super::*;
 
-    pub fn deposit_rndr(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        require_keys_eq!(
-            ctx.accounts.token_mint.key(),
-            Pubkey::from_str(RNDR_MINT).unwrap(),
-            CustomError::InvalidToken
-        );
-
+    /// Locks tokens from user into a job-specific escrow account
+    pub fn lock_payment(
+        ctx: Context<LockPayment>,
+        job_id: u64,
+        amount: u64,
+    ) -> Result<()> {
+        let escrow_key = ctx.accounts.escrow.key();
+        {
+            let escrow = &mut ctx.accounts.escrow;
+            
+            // Initialize escrow state
+            escrow.job_id = job_id;
+            escrow.user = ctx.accounts.user.key();
+            escrow.mint = ctx.accounts.mint.key();
+            escrow.amount = amount;
+            escrow.released_amount = 0;
+            escrow.status = EscrowStatus::Locked as u8;
+            escrow.bump = ctx.bumps.escrow;
+            
+            msg!("Job ID: {}", job_id);
+            msg!("Locking {} tokens for job {}", amount, job_id);
+        }
+        
+        // Transfer tokens from user to escrow token account using TransferChecked for robustness
         token_interface::transfer_checked(
             ctx.accounts.transfer_ctx(),
             amount,
-            ctx.accounts.token_mint.decimals,
+            ctx.accounts.mint.decimals,
         )?;
-
-        ctx.accounts.user_account.balance += amount;
+        
+        msg!("Tokens successfully locked in escrow PDA: {}", escrow_key);
         Ok(())
     }
 
-    pub fn withdraw_rndr(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        require_keys_eq!(
-            ctx.accounts.token_mint.key(),
-            Pubkey::from_str(RNDR_MINT).unwrap(),
-            CustomError::InvalidToken
-        );
-
-        require!(
-            ctx.accounts.user_account.balance >= amount,
-            CustomError::InsufficientBalance
-        );
-
-        let bump = ctx.accounts.vault_authority.bump;
-        let vault_seeds = &[b"vault_authority".as_ref(), &[bump]];
-        let signer = &[&vault_seeds[..]];
-
-        token_interface::transfer_checked(
-            ctx.accounts.transfer_ctx().with_signer(signer),
-            amount,
-            ctx.accounts.token_mint.decimals,
-        )?;
-
-        ctx.accounts.user_account.balance -= amount;
+    /// Placeholder for Batch Release (Phase 3)
+    pub fn batch_release(_ctx: Context<Placeholder>) -> Result<()> {
         Ok(())
     }
 
-    pub fn get_balance(ctx: Context<GetBalance>) -> Result<u64> {
-        Ok(ctx.accounts.user_account.balance)
+    /// Placeholder for Refund (Phase 4)
+    pub fn refund_remaining(_ctx: Context<Placeholder>) -> Result<()> {
+        Ok(())
     }
 }
 
+/// Escrow account storing state of a locked payment for a specific job
 #[account]
-pub struct VaultAuthority {
-    pub bump: u8,
+#[derive(InitSpace)]
+pub struct Escrow {
+    pub job_id: u64,           // 8 bytes
+    pub user: Pubkey,          // 32 bytes
+    pub mint: Pubkey,          // 32 bytes
+    pub amount: u64,           // 8 bytes
+    pub released_amount: u64,  // 8 bytes
+    pub status: u8,            // 1 byte
+    pub bump: u8,              // 1 byte
 }
 
-#[account]
-pub struct UserAccount {
-    pub owner: Pubkey,
-    pub balance: u64,
+/// Escrow status enumeration
+#[repr(u8)]
+pub enum EscrowStatus {
+    Locked = 0,
+    Partial = 1,
+    Released = 2,
+    Refunded = 3,
 }
 
+/// Accounts required for locking tokens into escrow
 #[derive(Accounts)]
-pub struct Deposit<'info> {
+#[instruction(job_id: u64, amount: u64)]
+pub struct LockPayment<'info> {
+    /// PDA that stores escrow state
+    /// Seeds: ["escrow", user.key(), job_id]
+    #[account(
+        init,
+        payer = user,
+        space = 8 + Escrow::INIT_SPACE,
+        seeds = [b"escrow", user.key().as_ref(), job_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub escrow: Account<'info, Escrow>,
+    
+    /// User locking the tokens
     #[account(mut)]
     pub user: Signer<'info>,
-
-    #[account(
-        init_if_needed,
-        payer = user,
-        space = 8 + 32 + 8,
-        seeds = [b"user", user.key().as_ref()],
-        bump
-    )]
-    pub user_account: Account<'info, UserAccount>,
-
-    #[account(
-        init_if_needed,
-        payer = user,
-        space = 8 + 1,
-        seeds = [b"vault_authority"],
-        bump
-    )]
-    pub vault_authority: Account<'info, VaultAuthority>,
-
+    
+    /// The mint of the tokens being locked (Supports Token & Token-2022)
+    pub mint: InterfaceAccount<'info, Mint>,
+    
+    /// User's token account
     #[account(
         mut,
-        token::mint = token_mint,
-        token::authority = vault_authority,
-        token::token_program = token_program,
-    )]
-    pub vault: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(mint::token_program = token_program)]
-    pub token_mint: InterfaceAccount<'info, Mint>,
-
-    #[account(
-        mut,
-        token::mint = token_mint,
-        token::token_program = token_program,
+        token::mint = mint,
+        token::authority = user,
     )]
     pub user_token_account: InterfaceAccount<'info, TokenAccount>,
-
+    
+    /// Escrow's token account (ATA of the PDA)
+    #[account(
+        init,
+        payer = user,
+        associated_token::mint = mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_token_account: InterfaceAccount<'info, TokenAccount>,
+    
     pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
 
-impl<'info> Deposit<'info> {
+impl<'info> LockPayment<'info> {
     pub fn transfer_ctx(&self) -> CpiContext<'_, '_, '_, 'info, TransferChecked<'info>> {
         CpiContext::new(
             self.token_program.to_account_info(),
             TransferChecked {
                 from: self.user_token_account.to_account_info(),
-                to: self.vault.to_account_info(),
+                to: self.escrow_token_account.to_account_info(),
                 authority: self.user.to_account_info(),
-                mint: self.token_mint.to_account_info(),
+                mint: self.mint.to_account_info(),
             },
         )
     }
 }
 
+/// Placeholder Context
 #[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"user", user.key().as_ref()],
-        bump
-    )]
-    pub user_account: Account<'info, UserAccount>,
-
-    #[account(
-        mut,
-        seeds = [b"vault_authority"],
-        bump = vault_authority.bump,
-    )]
-    pub vault_authority: Account<'info, VaultAuthority>,
-
-    #[account(
-        mut,
-        token::mint = token_mint,
-        token::authority = vault_authority,
-        token::token_program = token_program,
-    )]
-    pub vault: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(mint::token_program = token_program)]
-    pub token_mint: InterfaceAccount<'info, Mint>,
-
-    #[account(
-        mut,
-        token::mint = token_mint,
-        token::token_program = token_program,
-    )]
-    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    pub token_program: Interface<'info, TokenInterface>,
-    pub system_program: Program<'info, System>,
-}
-
-impl<'info> Withdraw<'info> {
-    pub fn transfer_ctx(&self) -> CpiContext<'_, '_, '_, 'info, TransferChecked<'info>> {
-        CpiContext::new(
-            self.token_program.to_account_info(),
-            TransferChecked {
-                from: self.vault.to_account_info(),
-                to: self.user_token_account.to_account_info(),
-                authority: self.vault_authority.to_account_info(),
-                mint: self.token_mint.to_account_info(),
-            },
-        )
-    }
-}
-
-#[derive(Accounts)]
-pub struct GetBalance<'info> {
-    #[account(
-        seeds = [b"user", user.key().as_ref()],
-        bump
-    )]
-    pub user_account: Account<'info, UserAccount>,
-    pub user: Signer<'info>,
-}
-
-#[error_code]
-pub enum CustomError {
-    #[msg("Only RNDR token is allowed")]
-    InvalidToken,
-    #[msg("Insufficient balance")]
-    InsufficientBalance,
-}
+pub struct Placeholder {}
