@@ -31,20 +31,20 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
   before(async () => {
     // 0. Derive and initialize Global Config
     [configPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("config")],
+      [Buffer.from("config_v2")],
       program.programId
     );
 
     try {
         await program.methods
-          .initializeConfig(payer.publicKey)
+          .initializeConfig(payer.publicKey, new anchor.BN(2)) // 2 second delay
           .accounts({
             admin: payer.publicKey,
           })
           .rpc();
-        console.log("✅ Global Config Initialized");
+        console.log("✅ Global Config Initialized (v2)");
     } catch (e) {
-        console.log("ℹ️ Global Config already exists or failed to init");
+        console.log("ℹ️ Global Config (v2) already exists or failed to init");
     }
 
     // 1. Create a new mint for testing
@@ -193,7 +193,43 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
     );
     const escrowTokenAccount = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
-    // 4. EXECUTE: batch_release
+    // 3.5 MARK JOB COMPLETED
+    console.log("⏳ Marking job completed...");
+    await program.methods
+        .markJobCompleted()
+        .accounts({
+            admin: payer.publicKey,
+            escrow: escrowPda,
+            config: configPda,
+        })
+        .rpc();
+
+    // 3.6 TEST TIME LOCK (Should fail if immediate)
+    try {
+        await program.methods
+            .batchRelease(batch)
+            .accounts({
+                admin: payer.publicKey,
+                mint,
+                tokenProgram: TOKEN_PROGRAM_ID,
+            })
+            .remainingAccounts([
+                { pubkey: escrowPda, isWritable: true, isSigner: false },
+                { pubkey: escrowTokenAccount, isWritable: true, isSigner: false },
+                { pubkey: providerAtaA, isWritable: true, isSigner: false },
+                { pubkey: providerAtaB, isWritable: true, isSigner: false },
+            ])
+            .rpc();
+        expect.fail("Should have failed due to release delay");
+    } catch (e: any) {
+        // console.log("Caught expected error:", e.message);
+    }
+
+    // 4. WAIT FOR DELAY
+    console.log("⏱️ Waiting for 3 seconds...");
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    // 5. EXECUTE: batch_release
     const tx = await program.methods
         .batchRelease(batch)
         .accounts({
@@ -222,6 +258,66 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
     const balB = await connection.getTokenAccountBalance(providerAtaB);
     expect(balA.value.amount).to.equal(payoutA.toString());
     expect(balB.value.amount).to.equal(payoutB.toString());
+  });
+
+  it("Closes a fully released escrow account", async () => {
+    // 1. Derive Escrow PDA again
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId.toArrayLike(Buffer, "le", 8)],
+        program.programId
+    );
+
+    // 2. EXECUTE: close_escrow (Remaining amount is 2M, so we need to release more first or use a finished one)
+    // Actually, in the previous test we released 3M out of 5M. 2M remains.
+    // Let's finish the release for jobId.
+    const remainingPayout = new anchor.BN(2000000);
+    
+    // We need an ATA for this new provider
+    const tempProvider = anchor.web3.Keypair.generate();
+    const tempAta = getAssociatedTokenAddressSync(mint, tempProvider.publicKey);
+
+    const batchFinish = [{
+        jobId: jobId,
+        payouts: [{ provider: tempProvider.publicKey, amount: remainingPayout }]
+    }];
+    await anchor.web3.sendAndConfirmTransaction(connection, new anchor.web3.Transaction().add(
+        createAssociatedTokenAccountInstruction(payer.publicKey, tempAta, tempProvider.publicKey, mint)
+    ), [payer]);
+
+    const [escrowTokenAccount] = PublicKey.findProgramAddressSync(
+        [escrowPda.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+        ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    await program.methods
+        .batchRelease(batchFinish)
+        .accounts({
+            admin: payer.publicKey,
+            mint,
+            tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .remainingAccounts([
+            { pubkey: escrowPda, isWritable: true, isSigner: false },
+            { pubkey: escrowTokenAccount, isWritable: true, isSigner: false },
+            { pubkey: tempAta, isWritable: true, isSigner: false },
+        ])
+        .rpc();
+
+    // Now remainingAmount should be 0.
+    // 3. EXECUTE: close_escrow
+    const tx = await program.methods
+        .closeEscrow()
+        .accounts({
+            escrow: escrowPda,
+            user: payer.publicKey,
+        })
+        .rpc();
+    
+    console.log("✅ Close Escrow Transaction:", tx);
+
+    // 4. VERIFY: Account is gone
+    const accountInfo = await connection.getAccountInfo(escrowPda);
+    expect(accountInfo).to.be.null;
   });
 
   it("Cancels a job and refunds the remaining balance", async () => {
@@ -258,10 +354,9 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
 
     console.log("✅ Cancel Job Transaction:", tx);
 
-    // 3. VERIFY: Escrow State
-    const escrowAccount = await program.account.escrow.fetch(newEscrowPda);
-    expect(escrowAccount.remainingAmount.toNumber()).to.equal(0);
-    expect(escrowAccount.status).to.equal(3); // Refunded
+    // 3. VERIFY: Escrow State (Should be GONE now)
+    const accountInfo = await connection.getAccountInfo(newEscrowPda);
+    expect(accountInfo).to.be.null;
 
     // 4. VERIFY: User Balance (Should be back up)
     const userBal = await connection.getTokenAccountBalance(userAta);

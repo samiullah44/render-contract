@@ -9,10 +9,23 @@ pub mod render_network {
     use super::*;
 
     /// Initializes global configuration
-    pub fn initialize_config(ctx: Context<InitializeConfig>, admin: Pubkey) -> Result<()> {
+    pub fn initialize_config(ctx: Context<InitializeConfig>, admin: Pubkey, release_delay: i64) -> Result<()> {
         let config = &mut ctx.accounts.config;
         config.admin = admin;
+        config.release_delay = release_delay;
         config.bump = ctx.bumps.config;
+        Ok(())
+    }
+
+    /// Updates global configuration and reallocates space if necessary
+    pub fn update_config(ctx: Context<UpdateConfig>, new_admin: Option<Pubkey>, new_delay: Option<i64>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        if let Some(admin) = new_admin {
+            config.admin = admin;
+        }
+        if let Some(delay) = new_delay {
+            config.release_delay = delay;
+        }
         Ok(())
     }
 
@@ -35,6 +48,7 @@ pub mod render_network {
             escrow.amount = amount;
             escrow.remaining_amount = amount; // Initial remaining is full amount
             escrow.released_amount = 0;
+            escrow.completed_at = 0; // Not yet completed
             escrow.status = EscrowStatus::Locked as u8;
             escrow.bump = ctx.bumps.escrow;
             
@@ -84,6 +98,14 @@ pub mod render_network {
             // Validate Escrow PDA and Job ID
             require!(escrow.job_id == item.job_id, NetworkError::JobIdMismatch);
             require!(escrow.status < EscrowStatus::Released as u8, NetworkError::InvalidStatus);
+
+            // Time Lock Challenge: verify the job is marked complete and delay has passed
+            require!(escrow.completed_at > 0, NetworkError::JobNotFinished);
+            let current_time = Clock::get()?.unix_timestamp;
+            require!(
+                current_time >= escrow.completed_at + config.release_delay,
+                NetworkError::ReleaseDelayNotMet
+            );
 
             let mut total_job_payout: u64 = 0;
 
@@ -193,6 +215,25 @@ pub mod render_network {
 
         Ok(())
     }
+
+    /// Closes an escrow account that is fully released or refunded to return rent to the user
+    pub fn close_escrow(_ctx: Context<CloseEscrow>) -> Result<()> {
+        msg!("Escrow account closed, rent refunded to user.");
+        Ok(())
+    }
+
+    /// Marks a job as completed and starts the release delay timer
+    pub fn mark_job_completed(ctx: Context<MarkJobCompleted>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+        
+        require!(ctx.accounts.admin.key() == config.admin, NetworkError::Unauthorized);
+        require!(escrow.completed_at == 0, NetworkError::InvalidStatus);
+        
+        escrow.completed_at = Clock::get()?.unix_timestamp;
+        msg!("Job {} marked as completed. Release timer started.", escrow.job_id);
+        Ok(())
+    }
 }
 
 /// Escrow account storing state of a locked payment for a specific job
@@ -205,6 +246,7 @@ pub struct Escrow {
     pub amount: u64,           // 8 bytes
     pub remaining_amount: u64,  // 8 bytes
     pub released_amount: u64,  // 8 bytes
+    pub completed_at: i64,      // 8 bytes (timestamp)
     pub status: u8,            // 1 byte
     pub bump: u8,              // 1 byte
 }
@@ -226,6 +268,7 @@ pub struct BatchItem {
 #[derive(InitSpace)]
 pub struct GlobalConfig {
     pub admin: Pubkey,         // 32 bytes
+    pub release_delay: i64,     // 8 bytes (seconds)
     pub bump: u8,              // 1 byte
 }
 
@@ -245,8 +288,26 @@ pub struct InitializeConfig<'info> {
         init,
         payer = admin,
         space = 8 + GlobalConfig::INIT_SPACE,
-        seeds = [b"config"],
+        seeds = [b"config_v2"],
         bump
+    )]
+    pub config: Account<'info, GlobalConfig>,
+    
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateConfig<'info> {
+    #[account(
+        mut,
+        seeds = [b"config_v2"],
+        bump = config.bump,
+        realloc = 8 + GlobalConfig::INIT_SPACE,
+        realloc::payer = admin,
+        realloc::zero = false,
+        constraint = config.admin == admin.key() @ NetworkError::Unauthorized,
     )]
     pub config: Account<'info, GlobalConfig>,
     
@@ -308,6 +369,7 @@ pub struct CancelJob<'info> {
         bump = escrow.bump,
         has_one = user,
         has_one = mint,
+        close = user,
     )]
     pub escrow: Account<'info, Escrow>,
     
@@ -338,7 +400,7 @@ pub struct CancelJob<'info> {
 #[derive(Accounts)]
 pub struct BatchRelease<'info> {
     #[account(
-        seeds = [b"config"],
+        seeds = [b"config_v2"],
         bump = config.bump
     )]
     pub config: Account<'info, GlobalConfig>,
@@ -349,6 +411,41 @@ pub struct BatchRelease<'info> {
     pub mint: InterfaceAccount<'info, Mint>,
     
     pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct CloseEscrow<'info> {
+    #[account(
+        mut,
+        seeds = [b"escrow", user.key().as_ref(), escrow.job_id.to_le_bytes().as_ref()],
+        bump = escrow.bump,
+        has_one = user,
+        constraint = escrow.remaining_amount == 0 @ NetworkError::JobNotFinished,
+        close = user,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut)]
+    pub user: SystemAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct MarkJobCompleted<'info> {
+    #[account(
+        seeds = [b"config_v2"],
+        bump = config.bump
+    )]
+    pub config: Account<'info, GlobalConfig>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"escrow", escrow.user.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
 }
 
 impl<'info> LockPayment<'info> {
@@ -411,6 +508,10 @@ pub enum NetworkError {
     NoFundsToRefund,
     #[msg("Mint mismatch")]
     MintMismatch,
+    #[msg("Job not yet finished or refunded")]
+    JobNotFinished,
+    #[msg("Release delay period has not yet passed")]
+    ReleaseDelayNotMet,
 }
 
 /// Placeholder Context
