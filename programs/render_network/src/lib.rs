@@ -2,6 +2,12 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, TokenInterface, TokenAccount, Mint, TransferChecked};
 use anchor_spl::associated_token::AssociatedToken;
 
+mod state;
+mod error;
+
+use crate::state::*;
+use crate::error::*;
+
 declare_id!("DWtobtz9kRZkCwh6s4FcN7yk6177rCY1T7xQHVdybmCz");
 
 #[program]
@@ -179,7 +185,7 @@ pub mod render_network {
         let refund_amount = escrow.remaining_amount;
         require!(refund_amount > 0, NetworkError::NoFundsToRefund);
 
-        // Transfer tokens back to user
+        // 1. Transfer tokens back to user
         let seeds = &[
             b"escrow",
             escrow.user.as_ref(),
@@ -203,6 +209,19 @@ pub mod render_network {
             ctx.accounts.mint.decimals,
         )?;
 
+        // 2. Close the token account to reclaim SOL rent
+        token_interface::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token_interface::CloseAccount {
+                    account: ctx.accounts.escrow_token_account.to_account_info(),
+                    destination: ctx.accounts.user.to_account_info(),
+                    authority: escrow.to_account_info(),
+                },
+                signer,
+            ),
+        )?;
+
         // Update state
         escrow.remaining_amount = 0;
         escrow.status = EscrowStatus::Refunded as u8;
@@ -217,8 +236,30 @@ pub mod render_network {
     }
 
     /// Closes an escrow account that is fully released or refunded to return rent to the user
-    pub fn close_escrow(_ctx: Context<CloseEscrow>) -> Result<()> {
-        msg!("Escrow account closed, rent refunded to user.");
+    pub fn close_escrow(ctx: Context<CloseEscrow>) -> Result<()> {
+        let escrow = &ctx.accounts.escrow;
+        let seeds = &[
+            b"escrow",
+            escrow.user.as_ref(),
+            &escrow.job_id.to_le_bytes(),
+            &[escrow.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        // Close the token account first
+        token_interface::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token_interface::CloseAccount {
+                    account: ctx.accounts.escrow_token_account.to_account_info(),
+                    destination: ctx.accounts.user.to_account_info(),
+                    authority: escrow.to_account_info(),
+                },
+                signer,
+            ),
+        )?;
+
+        msg!("Escrow state and token account closed, rent refunded to user.");
         Ok(())
     }
 
@@ -236,50 +277,7 @@ pub mod render_network {
     }
 }
 
-/// Escrow account storing state of a locked payment for a specific job
-#[account]
-#[derive(InitSpace)]
-pub struct Escrow {
-    pub job_id: u64,           // 8 bytes
-    pub user: Pubkey,          // 32 bytes
-    pub mint: Pubkey,          // 32 bytes
-    pub amount: u64,           // 8 bytes
-    pub remaining_amount: u64,  // 8 bytes
-    pub released_amount: u64,  // 8 bytes
-    pub completed_at: i64,      // 8 bytes (timestamp)
-    pub status: u8,            // 1 byte
-    pub bump: u8,              // 1 byte
-}
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct Payout {
-    pub provider: Pubkey,
-    pub amount: u64,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct BatchItem {
-    pub job_id: u64,
-    pub payouts: Vec<Payout>,
-}
-
-/// Global configuration account
-#[account]
-#[derive(InitSpace)]
-pub struct GlobalConfig {
-    pub admin: Pubkey,         // 32 bytes
-    pub release_delay: i64,     // 8 bytes (seconds)
-    pub bump: u8,              // 1 byte
-}
-
-/// Escrow status enumeration
-#[repr(u8)]
-pub enum EscrowStatus {
-    Locked = 0,
-    Partial = 1,
-    Released = 2,
-    Refunded = 3,
-}
 
 /// Accounts for initializing global config
 #[derive(Accounts)]
@@ -420,13 +418,25 @@ pub struct CloseEscrow<'info> {
         seeds = [b"escrow", user.key().as_ref(), escrow.job_id.to_le_bytes().as_ref()],
         bump = escrow.bump,
         has_one = user,
+        has_one = mint,
         constraint = escrow.remaining_amount == 0 @ NetworkError::JobNotFinished,
         close = user,
     )]
     pub escrow: Account<'info, Escrow>,
 
     #[account(mut)]
-    pub user: SystemAccount<'info>,
+    pub user: Signer<'info>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -487,32 +497,7 @@ pub struct JobCancelled {
     pub refund_amount: u64,
 }
 
-/// Custom error codes
-#[error_code]
-pub enum NetworkError {
-    #[msg("Amount must be greater than zero")]
-    InvalidAmount,
-    #[msg("Unauthorized access")]
-    Unauthorized,
-    #[msg("Job ID mismatch")]
-    JobIdMismatch,
-    #[msg("Invalid escrow status")]
-    InvalidStatus,
-    #[msg("Insufficient balance in escrow")]
-    InsufficientEscrowBalance,
-    #[msg("Arithmetic overflow")]
-    Overflow,
-    #[msg("Arithmetic underflow")]
-    Underflow,
-    #[msg("No funds available to refund")]
-    NoFundsToRefund,
-    #[msg("Mint mismatch")]
-    MintMismatch,
-    #[msg("Job not yet finished or refunded")]
-    JobNotFinished,
-    #[msg("Release delay period has not yet passed")]
-    ReleaseDelayNotMet,
-}
+
 
 /// Placeholder Context
 #[derive(Accounts)]

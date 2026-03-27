@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
+import { PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY, Keypair, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
@@ -10,6 +10,8 @@ import {
   getAccount,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
+  createCloseAccountInstruction,
+  createBurnInstruction,
 } from "@solana/spl-token";
 import { RenderNetwork } from "../target/types/render_network";
 import { expect } from "chai";
@@ -27,6 +29,14 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
   let configPda: PublicKey;
   const jobId = new anchor.BN(Math.floor(Math.random() * 1000000) + 1);
   const amount = new anchor.BN(5000000); // 5 tokens if 6 decimals
+
+  // Shared Provider keys and ATAs for cleanup
+  let providerA: Keypair;
+  let providerB: Keypair;
+  let tempProvider: Keypair;
+  let providerAtaA: PublicKey;
+  let providerAtaB: PublicKey;
+  let tempAta: PublicKey;
 
   before(async () => {
     // 0. Derive and initialize Global Config
@@ -55,12 +65,15 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
       null,
       6
     );
+    console.log("🪙 Test Token Mint Address:", mint.toString());
+    const cluster = provider.connection.rpcEndpoint.includes("devnet") ? "devnet" : "localnet";
+    console.log(`🔗 View Token on Explorer: https://explorer.solana.com/address/${mint.toString()}?cluster=${cluster}`);
 
     // 2. Create user token account and mint some tokens
     userAta = getAssociatedTokenAddressSync(mint, payer.publicKey);
     
     // Create the ATA and mint tokens
-    const txSetup = new anchor.web3.Transaction().add(
+    const txSetup = new Transaction().add(
         createAssociatedTokenAccountInstruction(
             payer.publicKey,
             userAta,
@@ -74,7 +87,60 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
             10000000 // 10 tokens
         )
     );
-    await anchor.web3.sendAndConfirmTransaction(connection, txSetup, [payer]);
+    await sendAndConfirmTransaction(connection, txSetup, [payer]);
+  });
+
+  // CLEANUP: Close all temporary ATAs to reclaim SOL
+  after(async () => {
+    console.log("🧹 Cleaning up test accounts...");
+    const balBefore = await connection.getBalance(payer.publicKey);
+    
+    // List of ATAs to close (Providers and Temp)
+    const targets = [
+        { ata: providerAtaA, owner: providerA },
+        { ata: providerAtaB, owner: providerB },
+        { ata: tempAta, owner: tempProvider },
+    ];
+
+    let closedCount = 0;
+    for (const target of targets) {
+        if (target.ata && target.owner) {
+            try {
+                const account = await getAccount(connection, target.ata);
+                const cleanupTx = new Transaction();
+                
+                // 1. Burn remaining tokens if any
+                if (account.amount > BigInt(0)) {
+                    cleanupTx.add(
+                        createBurnInstruction(
+                            target.ata,
+                            mint,
+                            target.owner.publicKey,
+                            account.amount
+                        )
+                    );
+                }
+                
+                // 2. Close account to reclaim SOL
+                cleanupTx.add(
+                    createCloseAccountInstruction(
+                        target.ata,
+                        payer.publicKey, // Destination
+                        target.owner.publicKey,
+                        []
+                    )
+                );
+                
+                await sendAndConfirmTransaction(connection, cleanupTx, [payer, target.owner]);
+                closedCount++;
+            } catch (e) {
+                // Account might already be closed or not exists
+            }
+        }
+    }
+    const balAfter = await connection.getBalance(payer.publicKey);
+    console.log(`✅ Cleanup complete. Closed ${closedCount} accounts.`);
+    console.log(`💰 SOL Reclaimed: ${((balAfter - balBefore) / anchor.web3.LAMPORTS_PER_SOL).toFixed(6)} SOL`);
   });
 
   it("Locks tokens for a specific job", async () => {
@@ -127,6 +193,7 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
     expect(escrowTokenBalance.value.amount).to.equal(amount.toString());
 
     const userTokenBalance = await connection.getTokenAccountBalance(userAta);
+    console.log(`💰 User Token Balance (After Lock): ${userTokenBalance.value.uiAmount} tokens`);
     expect(userTokenBalance.value.amount).to.equal("5000000"); // 10M - 5M = 5M
   });
 
@@ -163,17 +230,17 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
 
   it("Executes a Batch Release to multiple providers", async () => {
     // 1. Create two provider ATAs
-    const providerA = anchor.web3.Keypair.generate();
-    const providerB = anchor.web3.Keypair.generate();
+    providerA = Keypair.generate();
+    providerB = Keypair.generate();
     
-    const providerAtaA = getAssociatedTokenAddressSync(mint, providerA.publicKey);
-    const providerAtaB = getAssociatedTokenAddressSync(mint, providerB.publicKey);
+    providerAtaA = getAssociatedTokenAddressSync(mint, providerA.publicKey);
+    providerAtaB = getAssociatedTokenAddressSync(mint, providerB.publicKey);
 
-    const txAta = new anchor.web3.Transaction().add(
+    const txAta = new Transaction().add(
         createAssociatedTokenAccountInstruction(payer.publicKey, providerAtaA, providerA.publicKey, mint),
         createAssociatedTokenAccountInstruction(payer.publicKey, providerAtaB, providerB.publicKey, mint)
     );
-    await anchor.web3.sendAndConfirmTransaction(connection, txAta, [payer]);
+    await sendAndConfirmTransaction(connection, txAta, [payer]);
 
     // 2. Prepare Batch Data
     const payoutA = new anchor.BN(1000000); // 1 token
@@ -256,6 +323,8 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
     // 6. VERIFY: Provider Balances
     const balA = await connection.getTokenAccountBalance(providerAtaA);
     const balB = await connection.getTokenAccountBalance(providerAtaB);
+    console.log(`💰 Provider A Received: ${balA.value.uiAmount} tokens`);
+    console.log(`💰 Provider B Received: ${balB.value.uiAmount} tokens`);
     expect(balA.value.amount).to.equal(payoutA.toString());
     expect(balB.value.amount).to.equal(payoutB.toString());
   });
@@ -273,14 +342,14 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
     const remainingPayout = new anchor.BN(2000000);
     
     // We need an ATA for this new provider
-    const tempProvider = anchor.web3.Keypair.generate();
-    const tempAta = getAssociatedTokenAddressSync(mint, tempProvider.publicKey);
+    tempProvider = Keypair.generate();
+    tempAta = getAssociatedTokenAddressSync(mint, tempProvider.publicKey);
 
     const batchFinish = [{
         jobId: jobId,
         payouts: [{ provider: tempProvider.publicKey, amount: remainingPayout }]
     }];
-    await anchor.web3.sendAndConfirmTransaction(connection, new anchor.web3.Transaction().add(
+    await sendAndConfirmTransaction(connection, new Transaction().add(
         createAssociatedTokenAccountInstruction(payer.publicKey, tempAta, tempProvider.publicKey, mint)
     ), [payer]);
 
@@ -310,6 +379,9 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
         .accounts({
             escrow: escrowPda,
             user: payer.publicKey,
+            mint,
+            escrowTokenAccount,
+            tokenProgram: TOKEN_PROGRAM_ID,
         })
         .rpc();
     
@@ -343,12 +415,15 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
     // 2. EXECUTE: cancel_job
     const tx = await program.methods
         .cancelJob()
-        .accountsPartial({
+        .accounts({
             escrow: newEscrowPda,
             user: payer.publicKey,
             mint,
             userTokenAccount: userAta,
+            escrowTokenAccount: newEscrowTokenAccount,
             tokenProgram: TOKEN_PROGRAM_ID,
+            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+            systemProgram: SystemProgram.programId,
         })
         .rpc();
 
@@ -360,6 +435,7 @@ describe("Render Network - Hybrid Escrow (Phase 1)", () => {
 
     // 4. VERIFY: User Balance (Should be back up)
     const userBal = await connection.getTokenAccountBalance(userAta);
+    console.log(`💰 User Token Balance (After Cancellation Refund): ${userBal.value.uiAmount} tokens`);
     // User had 10M, spent 5M (Job 1), then 3M (Job 2), then got 3M back. Should have 5M.
     expect(userBal.value.amount).to.equal("5000000"); 
   });
