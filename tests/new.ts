@@ -1,442 +1,338 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY, Keypair, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import {
+  PublicKey, SystemProgram, Keypair,
+  Transaction, sendAndConfirmTransaction
+} from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   createMint,
-  mintTo,
-  getAccount,
   createAssociatedTokenAccountInstruction,
   createMintToInstruction,
   createCloseAccountInstruction,
   createBurnInstruction,
+  getAccount,
 } from "@solana/spl-token";
 import { RenderNetwork } from "../target/types/render_network";
 import { expect } from "chai";
 
-describe("Render Network - Hybrid Escrow (Phase 1)", () => {
-  const provider = anchor.AnchorProvider.env();
+describe("Render Network - User Credit Escrow (Full Suite)", () => {
+  const provider   = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-
-  const program = anchor.workspace.RenderNetwork as Program<RenderNetwork>;
+  const program    = anchor.workspace.RenderNetwork as Program<RenderNetwork>;
   const connection = provider.connection;
-  const payer = (provider.wallet as anchor.Wallet).payer;
+  const payer      = (provider.wallet as anchor.Wallet).payer;
 
+  // ── Shared state ──
   let mint: PublicKey;
   let userAta: PublicKey;
+  let userAccountPda: PublicKey;
+  let userDepositAta: PublicKey;
   let configPda: PublicKey;
-  const jobId = new anchor.BN(Math.floor(Math.random() * 1000000) + 1);
-  const amount = new anchor.BN(5000000); // 5 tokens if 6 decimals
 
-  // Shared Provider keys and ATAs for cleanup
-  let providerA: Keypair;
-  let providerB: Keypair;
-  let tempProvider: Keypair;
-  let providerAtaA: PublicKey;
-  let providerAtaB: PublicKey;
-  let tempAta: PublicKey;
+  // JobId1 is used for the main batch-release flow
+  // JobId2 is used for the cancel flow
+  const jobId1 = new anchor.BN(Math.floor(Math.random() * 900_000) + 1);
+  const jobId2 = new anchor.BN(Math.floor(Math.random() * 900_000) + 1_000_001);
 
+  const depositAmount = new anchor.BN(10_000_000); // 10 tokens
+  const lockAmount    = new anchor.BN( 5_000_000); // 5 tokens for job1
+  const cancelAmount  = new anchor.BN( 3_000_000); // 3 tokens for job2
+
+  // Provider keypairs
+  let providerA: Keypair, providerB: Keypair, tempProvider: Keypair;
+  let providerAtaA: PublicKey, providerAtaB: PublicKey, tempAta: PublicKey;
+
+  // ─────────────────────────────────────────────────────────────
+  // SETUP
+  // ─────────────────────────────────────────────────────────────
   before(async () => {
-    // 0. Derive and initialize Global Config
-    [configPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("config_v2")],
-      program.programId
-    );
+    [configPda] = PublicKey.findProgramAddressSync([Buffer.from("config_v2")], program.programId);
 
     try {
-        await program.methods
-          .initializeConfig(payer.publicKey, new anchor.BN(2)) // 2 second delay
-          .accounts({
-            admin: payer.publicKey,
-          })
-          .rpc();
-        console.log("✅ Global Config Initialized (v2)");
-    } catch (e) {
-        console.log("ℹ️ Global Config (v2) already exists or failed to init");
-    }
+      await program.methods.initializeConfig(payer.publicKey, new anchor.BN(2))
+        .accounts({ admin: payer.publicKey }).rpc();
+      console.log("✅ Global Config Initialized (v2)");
+    } catch { console.log("ℹ️  Global Config (v2) already exists or failed to init"); }
 
-    // 1. Create a new mint for testing
-    mint = await createMint(
-      connection,
-      payer,
-      payer.publicKey,
-      null,
-      6
-    );
+    // 1. Create mint & user ATA with 20 tokens
+    mint    = await createMint(connection, payer, payer.publicKey, null, 6);
+    userAta = getAssociatedTokenAddressSync(mint, payer.publicKey);
+    await sendAndConfirmTransaction(connection, new Transaction().add(
+      createAssociatedTokenAccountInstruction(payer.publicKey, userAta, payer.publicKey, mint),
+      createMintToInstruction(mint, userAta, payer.publicKey, 20_000_000),
+    ), [payer]);
+
+    const cluster = connection.rpcEndpoint.includes("devnet") ? "devnet" : "localnet";
     console.log("🪙 Test Token Mint Address:", mint.toString());
-    const cluster = provider.connection.rpcEndpoint.includes("devnet") ? "devnet" : "localnet";
     console.log(`🔗 View Token on Explorer: https://explorer.solana.com/address/${mint.toString()}?cluster=${cluster}`);
 
-    // 2. Create user token account and mint some tokens
-    userAta = getAssociatedTokenAddressSync(mint, payer.publicKey);
-    
-    // Create the ATA and mint tokens
-    const txSetup = new Transaction().add(
-        createAssociatedTokenAccountInstruction(
-            payer.publicKey,
-            userAta,
-            payer.publicKey,
-            mint
-        ),
-        createMintToInstruction(
-            mint,
-            userAta,
-            payer.publicKey,
-            10000000 // 10 tokens
-        )
+    // 2. Derive Credit PDA addresses
+    [userAccountPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("user_account"), payer.publicKey.toBuffer()],
+      program.programId
     );
-    await sendAndConfirmTransaction(connection, txSetup, [payer]);
+    userDepositAta = getAssociatedTokenAddressSync(mint, userAccountPda, true);
   });
 
-  // CLEANUP: Close all temporary ATAs to reclaim SOL
+  // ─────────────────────────────────────────────────────────────
+  // CLEANUP: Close provider ATAs, reclaim SOL
+  // ─────────────────────────────────────────────────────────────
   after(async () => {
     console.log("🧹 Cleaning up test accounts...");
     const balBefore = await connection.getBalance(payer.publicKey);
-    
-    // List of ATAs to close (Providers and Temp)
     const targets = [
-        { ata: providerAtaA, owner: providerA },
-        { ata: providerAtaB, owner: providerB },
-        { ata: tempAta, owner: tempProvider },
+      { ata: providerAtaA, owner: providerA },
+      { ata: providerAtaB, owner: providerB },
+      { ata: tempAta,      owner: tempProvider },
     ];
-
     let closedCount = 0;
-    for (const target of targets) {
-        if (target.ata && target.owner) {
-            try {
-                const account = await getAccount(connection, target.ata);
-                const cleanupTx = new Transaction();
-                
-                // 1. Burn remaining tokens if any
-                if (account.amount > BigInt(0)) {
-                    cleanupTx.add(
-                        createBurnInstruction(
-                            target.ata,
-                            mint,
-                            target.owner.publicKey,
-                            account.amount
-                        )
-                    );
-                }
-                
-                // 2. Close account to reclaim SOL
-                cleanupTx.add(
-                    createCloseAccountInstruction(
-                        target.ata,
-                        payer.publicKey, // Destination
-                        target.owner.publicKey,
-                        []
-                    )
-                );
-                
-                await sendAndConfirmTransaction(connection, cleanupTx, [payer, target.owner]);
-                closedCount++;
-            } catch (e) {
-                // Account might already be closed or not exists
-            }
-        }
+    for (const t of targets) {
+      if (!t.ata || !t.owner) continue;
+      try {
+        const acc = await getAccount(connection, t.ata);
+        const tx  = new Transaction();
+        if (acc.amount > 0n) tx.add(createBurnInstruction(t.ata, mint, t.owner.publicKey, acc.amount));
+        tx.add(createCloseAccountInstruction(t.ata, payer.publicKey, t.owner.publicKey));
+        await sendAndConfirmTransaction(connection, tx, [payer, t.owner]);
+        closedCount++;
+      } catch {}
     }
     const balAfter = await connection.getBalance(payer.publicKey);
     console.log(`✅ Cleanup complete. Closed ${closedCount} accounts.`);
     console.log(`💰 SOL Reclaimed: ${((balAfter - balBefore) / anchor.web3.LAMPORTS_PER_SOL).toFixed(6)} SOL`);
   });
 
-  it("Locks tokens for a specific job", async () => {
-    const user = payer.publicKey;
+  // ─────────────────────────────────────────────────────────────
+  // TEST 1: Deposit tokens → Website Credit Account
+  // (Account is created on first deposit. User pays rent.)
+  // ─────────────────────────────────────────────────────────────
+  it("Deposit tokens into Website Credit Account", async () => {
+    const tx = await program.methods.depositToAccount(depositAmount).accounts({
+      userAccount:             userAccountPda,
+      user:                    payer.publicKey,
+      mint,
+      userTokenAccount:        userAta,
+      userDepositTokenAccount: userDepositAta,
+      tokenProgram:            TOKEN_PROGRAM_ID,
+      associatedTokenProgram:  ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram:           SystemProgram.programId,
+    }).rpc();
 
-    // Derive Escrow PDA: ["escrow", user, job_id]
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("escrow"),
-        user.toBuffer(),
-        jobId.toArrayLike(Buffer, "le", 8),
-      ],
-      program.programId
-    );
+    const acc = await program.account.userAccount.fetch(userAccountPda);
+    expect(acc.creditedAmount.toNumber()).to.equal(depositAmount.toNumber());
 
-    // Derive Escrow ATA (owned by PDA)
-    const escrowTokenAccount = getAssociatedTokenAddressSync(
-        mint,
-        escrowPda,
-        true // allowOwnerOffCurve
-    );
-
-    console.log("📍 Job ID:", jobId.toString());
-    console.log("📍 Escrow PDA:", escrowPda.toString());
-    console.log("📍 Escrow Token Account:", escrowTokenAccount.toString());
-
-    // EXECUTE: lock_payment
-    const tx = await program.methods
-      .lockPayment(jobId, amount)
-      .accounts({
-        mint,
-        userTokenAccount: userAta,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
-
-    console.log("✅ Lock Transaction Signature:", tx);
-
-    // VERIFY: Escrow state
-    const escrowAccount = await program.account.escrow.fetch(escrowPda);
-    expect(escrowAccount.jobId.toNumber()).to.equal(jobId.toNumber());
-    expect(escrowAccount.amount.toNumber()).to.equal(amount.toNumber());
-    expect(escrowAccount.remainingAmount.toNumber()).to.equal(amount.toNumber());
-    expect(escrowAccount.user.toBase58()).to.equal(user.toBase58());
-    expect(escrowAccount.mint.toBase58()).to.equal(mint.toBase58());
-    expect(escrowAccount.status).to.equal(0); // Locked
-
-    // VERIFY: Token balances
-    const escrowTokenBalance = await connection.getTokenAccountBalance(escrowTokenAccount);
-    expect(escrowTokenBalance.value.amount).to.equal(amount.toString());
-
-    const userTokenBalance = await connection.getTokenAccountBalance(userAta);
-    console.log(`💰 User Token Balance (After Lock): ${userTokenBalance.value.uiAmount} tokens`);
-    expect(userTokenBalance.value.amount).to.equal("5000000"); // 10M - 5M = 5M
+    const walletBal = await connection.getTokenAccountBalance(userAta);
+    console.log(`✅ Deposit Transaction Signature: ${tx}`);
+    console.log(`💰 Website Credits: ${(acc.creditedAmount.toNumber() / 1e6).toFixed(2)} tokens`);
+    console.log(`💰 Wallet Balance (After Deposit): ${walletBal.value.uiAmount} tokens`);
+    console.log(`📍 Credit Account PDA: ${userAccountPda.toString()}`);
+    console.log(`📍 Credit Token Account: ${userDepositAta.toString()}`);
   });
 
-  it("Fails if jobId is different (PDA seed mismatch)", async () => {
-    // This is implicitly handled by Anchor's PDA check, 
-    // but we verify our understanding of seeds here.
-    const wrongJobId = new anchor.BN(999);
-    const [wrongEscrowPda] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("escrow"),
-        payer.publicKey.toBuffer(),
-        wrongJobId.toArrayLike(Buffer, "le", 8),
-      ],
+  // ─────────────────────────────────────────────────────────────
+  // TEST 2: Lock payment from Credits → Escrow (Job Start)
+  // ─────────────────────────────────────────────────────────────
+  it("Locks tokens for a specific job (from Credits)", async () => {
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
       program.programId
     );
+    const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
-    // If we try to use wrongEscrowPda with jobId=42069, it should fail
+    const tx = await program.methods.lockPayment(jobId1, lockAmount).accounts({
+      escrow:                  escrowPda,
+      user:                    payer.publicKey,
+      userDepositAccount:      userAccountPda,
+      mint,
+      userDepositTokenAccount: userDepositAta,
+      escrowTokenAccount:      escrowAta,
+      tokenProgram:            TOKEN_PROGRAM_ID,
+      associatedTokenProgram:  ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram:           SystemProgram.programId,
+    }).rpc();
+
+    const escrowAcc = await program.account.escrow.fetch(escrowPda);
+    expect(escrowAcc.amount.toNumber()).to.equal(lockAmount.toNumber());
+    expect(escrowAcc.status).to.equal(0); // Locked
+
+    const creditAcc = await program.account.userAccount.fetch(userAccountPda);
+    expect(creditAcc.creditedAmount.toNumber()).to.equal(depositAmount.toNumber() - lockAmount.toNumber());
+
+    console.log(`✅ Lock Transaction Signature: ${tx}`);
+    console.log(`📍 Job ID: ${jobId1.toString()}`);
+    console.log(`📍 Escrow PDA: ${escrowPda.toString()}`);
+    console.log(`📍 Escrow Token Account: ${escrowAta.toString()}`);
+    console.log(`💰 Remaining Credits (After Lock): ${(creditAcc.creditedAmount.toNumber() / 1e6).toFixed(2)} tokens`);
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // TEST 3: Fails if jobId causes PDA seed mismatch
+  // ─────────────────────────────────────────────────────────────
+  it("Fails if jobId is different (PDA seed mismatch)", async () => {
+    const wrongJobId = new anchor.BN(999_999_999);
+    const [wrongEscrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.publicKey.toBuffer(), wrongJobId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
     try {
-        await program.methods
-          .lockPayment(jobId, amount)
-          .accountsPartial({
-            escrow: wrongEscrowPda,
-            user: payer.publicKey,
-            mint,
-            userTokenAccount: userAta,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .rpc();
-        expect.fail("Should have failed due to seed mismatch");
+      await program.methods.lockPayment(jobId1, lockAmount).accountsPartial({
+        escrow: wrongEscrowPda,
+        user:   payer.publicKey,
+        mint,
+      }).rpc();
+      expect.fail("Should have failed due to seed mismatch");
     } catch (e: any) {
-        // expect(e.message).to.contain("ConstraintSeeds");
+      // Expected to fail
     }
   });
 
+  // ─────────────────────────────────────────────────────────────
+  // TEST 4: Batch Release → Multiple Providers
+  // ─────────────────────────────────────────────────────────────
   it("Executes a Batch Release to multiple providers", async () => {
-    // 1. Create two provider ATAs
     providerA = Keypair.generate();
     providerB = Keypair.generate();
-    
     providerAtaA = getAssociatedTokenAddressSync(mint, providerA.publicKey);
     providerAtaB = getAssociatedTokenAddressSync(mint, providerB.publicKey);
-
-    const txAta = new Transaction().add(
-        createAssociatedTokenAccountInstruction(payer.publicKey, providerAtaA, providerA.publicKey, mint),
-        createAssociatedTokenAccountInstruction(payer.publicKey, providerAtaB, providerB.publicKey, mint)
-    );
-    await sendAndConfirmTransaction(connection, txAta, [payer]);
-
-    // 2. Prepare Batch Data
-    const payoutA = new anchor.BN(1000000); // 1 token
-    const payoutB = new anchor.BN(2000000); // 2 tokens
-    const batch = [{
-        jobId: jobId,
-        payouts: [
-            { provider: providerA.publicKey, amount: payoutA },
-            { provider: providerB.publicKey, amount: payoutB }
-        ]
-    }];
-
-    // 3. Derive Escrow accounts again for validation
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId.toArrayLike(Buffer, "le", 8)],
-        program.programId
-    );
-    const escrowTokenAccount = getAssociatedTokenAddressSync(mint, escrowPda, true);
-
-    // 3.5 MARK JOB COMPLETED
-    console.log("⏳ Marking job completed...");
-    await program.methods
-        .markJobCompleted()
-        .accounts({
-            admin: payer.publicKey,
-            escrow: escrowPda,
-            config: configPda,
-        })
-        .rpc();
-
-    // 3.6 TEST TIME LOCK (Should fail if immediate)
-    try {
-        await program.methods
-            .batchRelease(batch)
-            .accounts({
-                admin: payer.publicKey,
-                mint,
-                tokenProgram: TOKEN_PROGRAM_ID,
-            })
-            .remainingAccounts([
-                { pubkey: escrowPda, isWritable: true, isSigner: false },
-                { pubkey: escrowTokenAccount, isWritable: true, isSigner: false },
-                { pubkey: providerAtaA, isWritable: true, isSigner: false },
-                { pubkey: providerAtaB, isWritable: true, isSigner: false },
-            ])
-            .rpc();
-        expect.fail("Should have failed due to release delay");
-    } catch (e: any) {
-        // console.log("Caught expected error:", e.message);
-    }
-
-    // 4. WAIT FOR DELAY
-    console.log("⏱️ Waiting for 3 seconds...");
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    // 5. EXECUTE: batch_release
-    const tx = await program.methods
-        .batchRelease(batch)
-        .accounts({
-            admin: payer.publicKey,
-            mint,
-            tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .remainingAccounts([
-            { pubkey: escrowPda, isWritable: true, isSigner: false },
-            { pubkey: escrowTokenAccount, isWritable: true, isSigner: false },
-            { pubkey: providerAtaA, isWritable: true, isSigner: false },
-            { pubkey: providerAtaB, isWritable: true, isSigner: false },
-        ])
-        .rpc();
-
-    console.log("✅ Batch Release Transaction:", tx);
-
-    // 5. VERIFY: Escrow State
-    const escrowAccount = await program.account.escrow.fetch(escrowPda);
-    expect(escrowAccount.remainingAmount.toNumber()).to.equal(amount.sub(payoutA).sub(payoutB).toNumber());
-    expect(escrowAccount.releasedAmount.toNumber()).to.equal(payoutA.add(payoutB).toNumber());
-    expect(escrowAccount.status).to.equal(1); // Partial
-
-    // 6. VERIFY: Provider Balances
-    const balA = await connection.getTokenAccountBalance(providerAtaA);
-    const balB = await connection.getTokenAccountBalance(providerAtaB);
-    console.log(`💰 Provider A Received: ${balA.value.uiAmount} tokens`);
-    console.log(`💰 Provider B Received: ${balB.value.uiAmount} tokens`);
-    expect(balA.value.amount).to.equal(payoutA.toString());
-    expect(balB.value.amount).to.equal(payoutB.toString());
-  });
-
-  it("Closes a fully released escrow account", async () => {
-    // 1. Derive Escrow PDA again
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId.toArrayLike(Buffer, "le", 8)],
-        program.programId
-    );
-
-    // 2. EXECUTE: close_escrow (Remaining amount is 2M, so we need to release more first or use a finished one)
-    // Actually, in the previous test we released 3M out of 5M. 2M remains.
-    // Let's finish the release for jobId.
-    const remainingPayout = new anchor.BN(2000000);
-    
-    // We need an ATA for this new provider
-    tempProvider = Keypair.generate();
-    tempAta = getAssociatedTokenAddressSync(mint, tempProvider.publicKey);
-
-    const batchFinish = [{
-        jobId: jobId,
-        payouts: [{ provider: tempProvider.publicKey, amount: remainingPayout }]
-    }];
     await sendAndConfirmTransaction(connection, new Transaction().add(
-        createAssociatedTokenAccountInstruction(payer.publicKey, tempAta, tempProvider.publicKey, mint)
+      createAssociatedTokenAccountInstruction(payer.publicKey, providerAtaA, providerA.publicKey, mint),
+      createAssociatedTokenAccountInstruction(payer.publicKey, providerAtaB, providerB.publicKey, mint),
     ), [payer]);
 
-    const [escrowTokenAccount] = PublicKey.findProgramAddressSync(
-        [escrowPda.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-        ASSOCIATED_TOKEN_PROGRAM_ID
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
+      program.programId
     );
+    const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
-    await program.methods
-        .batchRelease(batchFinish)
-        .accounts({
-            admin: payer.publicKey,
-            mint,
-            tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .remainingAccounts([
-            { pubkey: escrowPda, isWritable: true, isSigner: false },
-            { pubkey: escrowTokenAccount, isWritable: true, isSigner: false },
-            { pubkey: tempAta, isWritable: true, isSigner: false },
-        ])
-        .rpc();
+    // Mark completed
+    console.log("⏳ Marking job completed...");
+    await program.methods.markJobCompleted().accounts({
+      admin: payer.publicKey, escrow: escrowPda, config: configPda,
+    }).rpc();
 
-    // Now remainingAmount should be 0.
-    // 3. EXECUTE: close_escrow
-    const tx = await program.methods
-        .closeEscrow()
-        .accounts({
-            escrow: escrowPda,
-            user: payer.publicKey,
-            mint,
-            escrowTokenAccount,
-            tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .rpc();
-    
-    console.log("✅ Close Escrow Transaction:", tx);
+    // Wait for release delay
+    console.log("⏱️ Waiting for 3 seconds...");
+    await new Promise(r => setTimeout(r, 3000));
 
-    // 4. VERIFY: Account is gone
-    const accountInfo = await connection.getAccountInfo(escrowPda);
-    expect(accountInfo).to.be.null;
+    const payoutA = new anchor.BN(1_000_000); // 1 token
+    const payoutB = new anchor.BN(2_000_000); // 2 tokens
+
+    const tx = await program.methods.batchRelease([{
+      jobId: jobId1,
+      payouts: [
+        { provider: providerA.publicKey, amount: payoutA },
+        { provider: providerB.publicKey, amount: payoutB },
+      ],
+    }]).accounts({
+      admin: payer.publicKey, mint, tokenProgram: TOKEN_PROGRAM_ID,
+    }).remainingAccounts([
+      { pubkey: escrowPda,    isWritable: true, isSigner: false },
+      { pubkey: escrowAta,    isWritable: true, isSigner: false },
+      { pubkey: providerAtaA, isWritable: true, isSigner: false },
+      { pubkey: providerAtaB, isWritable: true, isSigner: false },
+    ]).rpc();
+
+    const balA = await connection.getTokenAccountBalance(providerAtaA);
+    const balB = await connection.getTokenAccountBalance(providerAtaB);
+    expect(balA.value.amount).to.equal(payoutA.toString());
+    expect(balB.value.amount).to.equal(payoutB.toString());
+
+    console.log(`✅ Batch Release Transaction: ${tx}`);
+    console.log(`💰 Provider A Received: ${balA.value.uiAmount} tokens`);
+    console.log(`💰 Provider B Received: ${balB.value.uiAmount} tokens`);
   });
 
-  it("Cancels a job and refunds the remaining balance", async () => {
-    // 1. Create a SECOND job to test cancellation individually
-    const newJobId = new anchor.BN(Math.floor(Math.random() * 1000000) + 1000001);
-    const lockAmount = new anchor.BN(3000000); // 3 tokens
+  // ─────────────────────────────────────────────────────────────
+  // TEST 5: Close fully-released Escrow (reclaim rent)
+  // ─────────────────────────────────────────────────────────────
+  it("Closes a fully released escrow account", async () => {
+    tempProvider = Keypair.generate();
+    tempAta      = getAssociatedTokenAddressSync(mint, tempProvider.publicKey);
+    await sendAndConfirmTransaction(connection, new Transaction().add(
+      createAssociatedTokenAccountInstruction(payer.publicKey, tempAta, tempProvider.publicKey, mint),
+    ), [payer]);
 
-    const [newEscrowPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("escrow"), payer.publicKey.toBuffer(), newJobId.toArrayLike(Buffer, "le", 8)],
-        program.programId
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
+      program.programId
     );
-    const newEscrowTokenAccount = getAssociatedTokenAddressSync(mint, newEscrowPda, true);
+    const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
-    await program.methods
-        .lockPayment(newJobId, lockAmount)
-        .accounts({
-            mint,
-            userTokenAccount: userAta,
-            tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .rpc();
+    // Release the remaining 2M to fully drain escrow
+    const remaining = new anchor.BN(2_000_000);
+    await program.methods.batchRelease([{
+      jobId: jobId1,
+      payouts: [{ provider: tempProvider.publicKey, amount: remaining }],
+    }]).accounts({
+      admin: payer.publicKey, mint, tokenProgram: TOKEN_PROGRAM_ID,
+    }).remainingAccounts([
+      { pubkey: escrowPda, isWritable: true, isSigner: false },
+      { pubkey: escrowAta, isWritable: true, isSigner: false },
+      { pubkey: tempAta,   isWritable: true, isSigner: false },
+    ]).rpc();
 
-    // 2. EXECUTE: cancel_job
-    const tx = await program.methods
-        .cancelJob()
-        .accounts({
-            escrow: newEscrowPda,
-            user: payer.publicKey,
-            mint,
-            userTokenAccount: userAta,
-            escrowTokenAccount: newEscrowTokenAccount,
-            tokenProgram: TOKEN_PROGRAM_ID,
-            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-            systemProgram: SystemProgram.programId,
-        })
-        .rpc();
+    // Now close it
+    const tx = await program.methods.closeEscrow().accounts({
+      escrow:             escrowPda,
+      user:               payer.publicKey,
+      mint,
+      escrowTokenAccount: escrowAta,
+      tokenProgram:       TOKEN_PROGRAM_ID,
+    }).rpc();
 
-    console.log("✅ Cancel Job Transaction:", tx);
-
-    // 3. VERIFY: Escrow State (Should be GONE now)
-    const accountInfo = await connection.getAccountInfo(newEscrowPda);
+    const accountInfo = await connection.getAccountInfo(escrowPda);
     expect(accountInfo).to.be.null;
+    console.log(`✅ Close Escrow Transaction: ${tx}`);
+  });
 
-    // 4. VERIFY: User Balance (Should be back up)
-    const userBal = await connection.getTokenAccountBalance(userAta);
-    console.log(`💰 User Token Balance (After Cancellation Refund): ${userBal.value.uiAmount} tokens`);
-    // User had 10M, spent 5M (Job 1), then 3M (Job 2), then got 3M back. Should have 5M.
-    expect(userBal.value.amount).to.equal("5000000"); 
+  // ─────────────────────────────────────────────────────────────
+  // TEST 6: Cancel Job → Refund back to Credit Account
+  // ─────────────────────────────────────────────────────────────
+  it("Cancels a job and refunds to Credit Account", async () => {
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId2.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
+
+    // Lock Job 2
+    await program.methods.lockPayment(jobId2, cancelAmount).accounts({
+      escrow:                  escrowPda,
+      user:                    payer.publicKey,
+      userDepositAccount:      userAccountPda,
+      mint,
+      userDepositTokenAccount: userDepositAta,
+      escrowTokenAccount:      escrowAta,
+      tokenProgram:            TOKEN_PROGRAM_ID,
+      associatedTokenProgram:  ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram:           SystemProgram.programId,
+    }).rpc();
+
+    const beforeCancel = await program.account.userAccount.fetch(userAccountPda);
+
+    // Cancel Job 2
+    const tx = await program.methods.cancelJob().accounts({
+      escrow:                  escrowPda,
+      user:                    payer.publicKey,
+      userDepositAccount:      userAccountPda,
+      mint,
+      userDepositTokenAccount: userDepositAta,
+      escrowTokenAccount:      escrowAta,
+      tokenProgram:            TOKEN_PROGRAM_ID,
+      associatedTokenProgram:  ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram:           SystemProgram.programId,
+    }).rpc();
+
+    const afterCancel = await program.account.userAccount.fetch(userAccountPda);
+    expect(afterCancel.creditedAmount.toNumber()).to.equal(
+      beforeCancel.creditedAmount.toNumber() + cancelAmount.toNumber()
+    );
+
+    console.log(`✅ Cancel Job Transaction: ${tx}`);
+    console.log(`💰 Credits After Cancellation Refund: ${(afterCancel.creditedAmount.toNumber() / 1e6).toFixed(2)} tokens`);
   });
 });

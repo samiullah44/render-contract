@@ -14,73 +14,149 @@ declare_id!("DWtobtz9kRZkCwh6s4FcN7yk6177rCY1T7xQHVdybmCz");
 pub mod render_network {
     use super::*;
 
-    /// Initializes global configuration
+    // ─────────────────────────────────────────────────────────────
+    // ADMIN: Global Config
+    // ─────────────────────────────────────────────────────────────
+
     pub fn initialize_config(ctx: Context<InitializeConfig>, admin: Pubkey, release_delay: i64) -> Result<()> {
         let config = &mut ctx.accounts.config;
         config.admin = admin;
         config.release_delay = release_delay;
         config.bump = ctx.bumps.config;
+        msg!("Global config initialized. Admin: {}", admin);
         Ok(())
     }
 
-    /// Updates global configuration and reallocates space if necessary
     pub fn update_config(ctx: Context<UpdateConfig>, new_admin: Option<Pubkey>, new_delay: Option<i64>) -> Result<()> {
         let config = &mut ctx.accounts.config;
-        if let Some(admin) = new_admin {
-            config.admin = admin;
-        }
-        if let Some(delay) = new_delay {
-            config.release_delay = delay;
-        }
+        if let Some(admin) = new_admin { config.admin = admin; }
+        if let Some(delay) = new_delay { config.release_delay = delay; }
         Ok(())
     }
 
-    /// Locks tokens from user into a job-specific escrow account
-    pub fn lock_payment(
-        ctx: Context<LockPayment>,
-        job_id: u64,
-        amount: u64,
-    ) -> Result<()> {
+    // ─────────────────────────────────────────────────────────────
+    // USER: Deposit tokens to their "Website Credit Account"
+    // Account is initialized on first deposit (user pays rent).
+    // Gas fee is paid by the user as part of the transaction.
+    // ─────────────────────────────────────────────────────────────
+
+    pub fn deposit_to_account(ctx: Context<DepositToAccount>, amount: u64) -> Result<()> {
         require!(amount > 0, NetworkError::InvalidAmount);
-        
-        let escrow_key = ctx.accounts.escrow.key();
-        {
-            let escrow = &mut ctx.accounts.escrow;
-            
-            // Initialize escrow state
-            escrow.job_id = job_id;
-            escrow.user = ctx.accounts.user.key();
-            escrow.mint = ctx.accounts.mint.key();
-            escrow.amount = amount;
-            escrow.remaining_amount = amount; // Initial remaining is full amount
-            escrow.released_amount = 0;
-            escrow.completed_at = 0; // Not yet completed
-            escrow.status = EscrowStatus::Locked as u8;
-            escrow.bump = ctx.bumps.escrow;
-            
-            msg!("Job ID: {}", job_id);
-            msg!("Locking {} tokens for job {}", amount, job_id);
+
+        let user_account = &mut ctx.accounts.user_account;
+
+        // Initialize on first deposit
+        if user_account.owner == Pubkey::default() {
+            user_account.owner = ctx.accounts.user.key();
+            user_account.mint  = ctx.accounts.mint.key();
+            user_account.credited_amount = 0;
+            user_account.bump  = ctx.bumps.user_account;
         }
-        
-        // Transfer tokens from user to escrow token account using TransferChecked for robustness
+
+        // Verify mint matches
+        require!(user_account.mint == ctx.accounts.mint.key(), NetworkError::MintMismatch);
+
+        // Transfer: User Wallet ATA → User Credit PDA ATA
         token_interface::transfer_checked(
-            ctx.accounts.transfer_ctx(),
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from:      ctx.accounts.user_token_account.to_account_info(),
+                    to:        ctx.accounts.user_deposit_token_account.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
+                },
+            ),
             amount,
             ctx.accounts.mint.decimals,
         )?;
 
-        emit!(PaymentLocked {
-            job_id,
-            user: ctx.accounts.user.key(),
-            mint: ctx.accounts.mint.key(),
-            amount,
-        });
-        
-        msg!("Tokens successfully locked in escrow PDA: {}", escrow_key);
+        user_account.credited_amount = user_account.credited_amount
+            .checked_add(amount).ok_or(NetworkError::Overflow)?;
+
+        msg!("Deposited {} tokens to credit account. New balance: {}", amount, user_account.credited_amount);
         Ok(())
     }
 
-    /// Placeholder for Batch Release (Phase 2)
+    // ─────────────────────────────────────────────────────────────
+    // USER: Lock payment from Credit Account → Escrow PDA (Job Start)
+    // ─────────────────────────────────────────────────────────────
+
+    pub fn lock_payment(ctx: Context<LockPayment>, job_id: u64, amount: u64) -> Result<()> {
+        require!(amount > 0, NetworkError::InvalidAmount);
+
+        // Verify sufficient credits
+        let user_account = &mut ctx.accounts.user_deposit_account;
+        require!(user_account.credited_amount >= amount, NetworkError::InsufficientEscrowBalance);
+        require!(user_account.mint == ctx.accounts.mint.key(), NetworkError::MintMismatch);
+
+        // Initialize Escrow
+        let escrow = &mut ctx.accounts.escrow;
+        escrow.job_id           = job_id;
+        escrow.user             = ctx.accounts.user.key();
+        escrow.mint             = ctx.accounts.mint.key();
+        escrow.amount           = amount;
+        escrow.remaining_amount = amount;
+        escrow.released_amount  = 0;
+        escrow.completed_at     = 0;
+        escrow.status           = EscrowStatus::Locked as u8;
+        escrow.bump             = ctx.bumps.escrow;
+
+        // Transfer: User Credit PDA ATA → Escrow PDA ATA
+        // Signed by the UserAccount PDA
+        let owner_key = user_account.owner;
+        let bump = user_account.bump;
+        let seeds = &[
+            b"user_account",
+            owner_key.as_ref(),
+            &[bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from:      ctx.accounts.user_deposit_token_account.to_account_info(),
+                    to:        ctx.accounts.escrow_token_account.to_account_info(),
+                    authority: user_account.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
+                },
+                signer,
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        // Deduct from credits
+        user_account.credited_amount = user_account.credited_amount
+            .checked_sub(amount).ok_or(NetworkError::Underflow)?;
+
+        emit!(PaymentLocked { job_id, user: ctx.accounts.user.key(), mint: ctx.accounts.mint.key(), amount });
+        msg!("Locked {} tokens from Credits into Escrow. Remaining credits: {}", amount, user_account.credited_amount);
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // ADMIN: Mark job completed (starts release timer)
+    // ─────────────────────────────────────────────────────────────
+
+    pub fn mark_job_completed(ctx: Context<MarkJobCompleted>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        let config = &ctx.accounts.config;
+
+        require!(ctx.accounts.admin.key() == config.admin, NetworkError::Unauthorized);
+        require!(escrow.completed_at == 0, NetworkError::InvalidStatus);
+
+        escrow.completed_at = Clock::get()?.unix_timestamp;
+        msg!("Job {} marked completed. Release delay timer started.", escrow.job_id);
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // ADMIN: Batch Release → Node Providers (after release delay)
+    // ─────────────────────────────────────────────────────────────
+
     pub fn batch_release<'info>(ctx: Context<'_, '_, 'info, 'info, BatchRelease<'info>>, batch: Vec<BatchItem>) -> Result<()> {
         let config = &ctx.accounts.config;
         require!(ctx.accounts.admin.key() == config.admin, NetworkError::Unauthorized);
@@ -88,63 +164,44 @@ pub mod render_network {
         let mut remaining_accounts_iter = ctx.remaining_accounts.iter();
 
         for item in batch.iter() {
-            // 1. Get Escrow Account (Passed via remaining accounts)
-            let escrow_info = next_account_info(&mut remaining_accounts_iter)?;
-            let mut escrow = Account::<Escrow>::try_from(escrow_info)?;
-            
-            // 2. Get Escrow Token Account
+            let escrow_info       = next_account_info(&mut remaining_accounts_iter)?;
+            let mut escrow        = Account::<Escrow>::try_from(escrow_info)?;
             let escrow_token_info = next_account_info(&mut remaining_accounts_iter)?;
             let escrow_token_account = InterfaceAccount::<TokenAccount>::try_from(escrow_token_info)?;
-            
-            // Security: Verify Escrow Token Account ownership and mint
-            require!(escrow_token_account.owner == escrow_info.key(), NetworkError::Unauthorized);
-            require!(escrow_token_account.mint == escrow.mint, NetworkError::MintMismatch);
-            require!(escrow.mint == ctx.accounts.mint.key(), NetworkError::MintMismatch);
 
-            // Validate Escrow PDA and Job ID
+            // Security checks
+            require!(escrow_token_account.owner == escrow_info.key(), NetworkError::Unauthorized);
+            require!(escrow_token_account.mint  == escrow.mint, NetworkError::MintMismatch);
+            require!(escrow.mint == ctx.accounts.mint.key(), NetworkError::MintMismatch);
             require!(escrow.job_id == item.job_id, NetworkError::JobIdMismatch);
             require!(escrow.status < EscrowStatus::Released as u8, NetworkError::InvalidStatus);
-
-            // Time Lock Challenge: verify the job is marked complete and delay has passed
             require!(escrow.completed_at > 0, NetworkError::JobNotFinished);
             let current_time = Clock::get()?.unix_timestamp;
-            require!(
-                current_time >= escrow.completed_at + config.release_delay,
-                NetworkError::ReleaseDelayNotMet
-            );
+            require!(current_time >= escrow.completed_at + config.release_delay, NetworkError::ReleaseDelayNotMet);
 
             let mut total_job_payout: u64 = 0;
 
             for payout in item.payouts.iter() {
-                // 3. Get Provider Token Account
-                let provider_token_info = next_account_info(&mut remaining_accounts_iter)?;
+                let provider_token_info    = next_account_info(&mut remaining_accounts_iter)?;
                 let provider_token_account = InterfaceAccount::<TokenAccount>::try_from(provider_token_info)?;
-                
-                // Security: Verify Provider Token Account ownership and mint
-                require!(provider_token_account.owner == payout.provider, NetworkError::Unauthorized);
-                require!(provider_token_account.mint == escrow.mint, NetworkError::MintMismatch);
 
-                // Math: Calculate total payout for this job in the batch
+                require!(provider_token_account.owner == payout.provider, NetworkError::Unauthorized);
+                require!(provider_token_account.mint  == escrow.mint, NetworkError::MintMismatch);
+
                 total_job_payout = total_job_payout.checked_add(payout.amount).ok_or(NetworkError::Overflow)?;
                 require!(total_job_payout <= escrow.remaining_amount, NetworkError::InsufficientEscrowBalance);
 
-                // Perform Transfer
-                let seeds = &[
-                    b"escrow",
-                    escrow.user.as_ref(),
-                    &escrow.job_id.to_le_bytes(),
-                    &[escrow.bump],
-                ];
+                let seeds  = &[b"escrow", escrow.user.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
                 let signer = &[&seeds[..]];
 
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
                         TransferChecked {
-                            from: escrow_token_info.to_account_info(),
-                            to: provider_token_info.to_account_info(),
+                            from:      escrow_token_info.to_account_info(),
+                            to:        provider_token_info.to_account_info(),
                             authority: escrow_info.to_account_info(),
-                            mint: ctx.accounts.mint.to_account_info(),
+                            mint:      ctx.accounts.mint.to_account_info(),
                         },
                         signer,
                     ),
@@ -152,31 +209,23 @@ pub mod render_network {
                     ctx.accounts.mint.decimals,
                 )?;
 
-                emit!(PaymentReleased {
-                    job_id: escrow.job_id,
-                    provider: provider_token_info.key(),
-                    amount: payout.amount,
-                });
+                emit!(PaymentReleased { job_id: escrow.job_id, provider: provider_token_info.key(), amount: payout.amount });
             }
 
-            // Update Escrow State
             escrow.remaining_amount = escrow.remaining_amount.checked_sub(total_job_payout).ok_or(NetworkError::Underflow)?;
-            escrow.released_amount = escrow.released_amount.checked_add(total_job_payout).ok_or(NetworkError::Overflow)?;
-            
-            if escrow.remaining_amount == 0 {
-                escrow.status = EscrowStatus::Released as u8;
-            } else {
-                escrow.status = EscrowStatus::Partial as u8;
-            }
-            
-            // Manually save the account because we loaded it from remaining_accounts
+            escrow.released_amount  = escrow.released_amount.checked_add(total_job_payout).ok_or(NetworkError::Overflow)?;
+            escrow.status = if escrow.remaining_amount == 0 { EscrowStatus::Released as u8 } else { EscrowStatus::Partial as u8 };
+
             escrow.exit(ctx.program_id)?;
         }
 
         Ok(())
     }
 
-    /// Refunds remaining tokens to the user and marks job as Refunded (Phase 3)
+    // ─────────────────────────────────────────────────────────────
+    // USER: Cancel Job → Refund back to Credit Account
+    // ─────────────────────────────────────────────────────────────
+
     pub fn cancel_job(ctx: Context<CancelJob>) -> Result<()> {
         let escrow = &mut ctx.accounts.escrow;
         require!(escrow.user == ctx.accounts.user.key(), NetworkError::Unauthorized);
@@ -185,23 +234,18 @@ pub mod render_network {
         let refund_amount = escrow.remaining_amount;
         require!(refund_amount > 0, NetworkError::NoFundsToRefund);
 
-        // 1. Transfer tokens back to user
-        let seeds = &[
-            b"escrow",
-            escrow.user.as_ref(),
-            &escrow.job_id.to_le_bytes(),
-            &[escrow.bump],
-        ];
+        let seeds  = &[b"escrow", escrow.user.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
         let signer = &[&seeds[..]];
 
+        // Transfer: Escrow PDA ATA → User Credit PDA ATA
         token_interface::transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 TransferChecked {
-                    from: ctx.accounts.escrow_token_account.to_account_info(),
-                    to: ctx.accounts.user_token_account.to_account_info(),
+                    from:      ctx.accounts.escrow_token_account.to_account_info(),
+                    to:        ctx.accounts.user_deposit_token_account.to_account_info(),
                     authority: escrow.to_account_info(),
-                    mint: ctx.accounts.mint.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
                 },
                 signer,
             ),
@@ -209,77 +253,61 @@ pub mod render_network {
             ctx.accounts.mint.decimals,
         )?;
 
-        // 2. Close the token account to reclaim SOL rent
+        // Close the Escrow Token Account (reclaim rent → user)
         token_interface::close_account(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 token_interface::CloseAccount {
-                    account: ctx.accounts.escrow_token_account.to_account_info(),
+                    account:     ctx.accounts.escrow_token_account.to_account_info(),
                     destination: ctx.accounts.user.to_account_info(),
-                    authority: escrow.to_account_info(),
+                    authority:   escrow.to_account_info(),
                 },
                 signer,
             ),
         )?;
 
-        // Update state
+        // Restore credits
+        ctx.accounts.user_deposit_account.credited_amount = ctx.accounts.user_deposit_account.credited_amount
+            .checked_add(refund_amount).ok_or(NetworkError::Overflow)?;
+
         escrow.remaining_amount = 0;
         escrow.status = EscrowStatus::Refunded as u8;
 
-        emit!(JobCancelled {
-            job_id: escrow.job_id,
-            user: escrow.user,
-            refund_amount,
-        });
-
+        emit!(JobCancelled { job_id: escrow.job_id, user: escrow.user, refund_amount });
+        msg!("Job {} cancelled. {} tokens refunded to credit account.", escrow.job_id, refund_amount);
         Ok(())
     }
 
-    /// Closes an escrow account that is fully released or refunded to return rent to the user
+    // ─────────────────────────────────────────────────────────────
+    // USER: Close fully-released Escrow (reclaim rent)
+    // ─────────────────────────────────────────────────────────────
+
     pub fn close_escrow(ctx: Context<CloseEscrow>) -> Result<()> {
         let escrow = &ctx.accounts.escrow;
-        let seeds = &[
-            b"escrow",
-            escrow.user.as_ref(),
-            &escrow.job_id.to_le_bytes(),
-            &[escrow.bump],
-        ];
+        let seeds  = &[b"escrow", escrow.user.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
         let signer = &[&seeds[..]];
 
-        // Close the token account first
         token_interface::close_account(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 token_interface::CloseAccount {
-                    account: ctx.accounts.escrow_token_account.to_account_info(),
+                    account:     ctx.accounts.escrow_token_account.to_account_info(),
                     destination: ctx.accounts.user.to_account_info(),
-                    authority: escrow.to_account_info(),
+                    authority:   escrow.to_account_info(),
                 },
                 signer,
             ),
         )?;
 
-        msg!("Escrow state and token account closed, rent refunded to user.");
-        Ok(())
-    }
-
-    /// Marks a job as completed and starts the release delay timer
-    pub fn mark_job_completed(ctx: Context<MarkJobCompleted>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        let config = &ctx.accounts.config;
-        
-        require!(ctx.accounts.admin.key() == config.admin, NetworkError::Unauthorized);
-        require!(escrow.completed_at == 0, NetworkError::InvalidStatus);
-        
-        escrow.completed_at = Clock::get()?.unix_timestamp;
-        msg!("Job {} marked as completed. Release timer started.", escrow.job_id);
+        msg!("Escrow closed. Rent returned to user.");
         Ok(())
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ACCOUNT CONTEXTS
+// ─────────────────────────────────────────────────────────────────────────────
 
-
-/// Accounts for initializing global config
 #[derive(Accounts)]
 pub struct InitializeConfig<'info> {
     #[account(
@@ -290,7 +318,6 @@ pub struct InitializeConfig<'info> {
         bump
     )]
     pub config: Account<'info, GlobalConfig>,
-    
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -308,18 +335,56 @@ pub struct UpdateConfig<'info> {
         constraint = config.admin == admin.key() @ NetworkError::Unauthorized,
     )]
     pub config: Account<'info, GlobalConfig>,
-    
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
-/// Accounts required for locking tokens into escrow
+/// User deposits tokens from their wallet into their Credit PDA.
+/// On first call: creates the UserAccount PDA and its ATA.
+/// User pays all rent (no platform cost).
+#[derive(Accounts)]
+pub struct DepositToAccount<'info> {
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + UserAccount::INIT_SPACE,
+        seeds = [b"user_account", user.key().as_ref()],
+        bump
+    )]
+    pub user_account: Box<Account<'info, UserAccount>>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// User's own wallet token account (source of funds)
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = user,
+    )]
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Credit PDA's token account (destination). Initialized if needed.
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = mint,
+        associated_token::authority = user_account,
+    )]
+    pub user_deposit_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+/// User starts a job: moves tokens from their Credit Account → Job Escrow.
 #[derive(Accounts)]
 #[instruction(job_id: u64, amount: u64)]
 pub struct LockPayment<'info> {
-    /// PDA that stores escrow state
-    /// Seeds: ["escrow", user.key(), job_id]
     #[account(
         init,
         payer = user,
@@ -327,38 +392,69 @@ pub struct LockPayment<'info> {
         seeds = [b"escrow", user.key().as_ref(), job_id.to_le_bytes().as_ref()],
         bump
     )]
-    pub escrow: Account<'info, Escrow>,
-    
-    /// User locking the tokens
+    pub escrow: Box<Account<'info, Escrow>>,
+
     #[account(mut)]
     pub user: Signer<'info>,
-    
-    /// The mint of the tokens being locked (Supports Token & Token-2022)
-    pub mint: InterfaceAccount<'info, Mint>,
-    
-    /// User's token account
+
+    /// The user's Credit Account (source of funds)
     #[account(
         mut,
-        token::mint = mint,
-        token::authority = user,
+        seeds = [b"user_account", user.key().as_ref()],
+        bump = user_deposit_account.bump,
+        constraint = user_deposit_account.owner == user.key() @ NetworkError::Unauthorized,
     )]
-    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
-    
-    /// Escrow's token account (ATA of the PDA)
+    pub user_deposit_account: Box<Account<'info, UserAccount>>,
+
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Credit PDA's token ATA (source of tokens)
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = user_deposit_account,
+    )]
+    pub user_deposit_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Escrow PDA's token ATA (destination). Created here.
     #[account(
         init,
         payer = user,
         associated_token::mint = mint,
         associated_token::authority = escrow,
     )]
-    pub escrow_token_account: InterfaceAccount<'info, TokenAccount>,
-    
+    pub escrow_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
+#[derive(Accounts)]
+pub struct MarkJobCompleted<'info> {
+    #[account(seeds = [b"config_v2"], bump = config.bump)]
+    pub config: Account<'info, GlobalConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"escrow", escrow.user.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+}
+
+#[derive(Accounts)]
+pub struct BatchRelease<'info> {
+    #[account(seeds = [b"config_v2"], bump = config.bump)]
+    pub config: Account<'info, GlobalConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+/// Cancel job: Escrow tokens → User Credit Account. Escrow ATA closed.
 #[derive(Accounts)]
 pub struct CancelJob<'info> {
     #[account(
@@ -369,48 +465,42 @@ pub struct CancelJob<'info> {
         has_one = mint,
         close = user,
     )]
-    pub escrow: Account<'info, Escrow>,
-    
+    pub escrow: Box<Account<'info, Escrow>>,
+
     #[account(mut)]
     pub user: Signer<'info>,
-    
-    pub mint: InterfaceAccount<'info, Mint>,
-    
+
+    #[account(
+        mut,
+        seeds = [b"user_account", user.key().as_ref()],
+        bump = user_deposit_account.bump,
+    )]
+    pub user_deposit_account: Box<Account<'info, UserAccount>>,
+
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Refund destination: User's Credit PDA ATA
     #[account(
         mut,
         associated_token::mint = mint,
-        associated_token::authority = user,
+        associated_token::authority = user_deposit_account,
     )]
-    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
-    
+    pub user_deposit_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Escrow's token ATA (to be closed)
     #[account(
         mut,
         associated_token::mint = mint,
         associated_token::authority = escrow,
     )]
-    pub escrow_token_account: InterfaceAccount<'info, TokenAccount>,
-    
+    pub escrow_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
-#[derive(Accounts)]
-pub struct BatchRelease<'info> {
-    #[account(
-        seeds = [b"config_v2"],
-        bump = config.bump
-    )]
-    pub config: Account<'info, GlobalConfig>,
-    
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    
-    pub mint: InterfaceAccount<'info, Mint>,
-    
-    pub token_program: Interface<'info, TokenInterface>,
-}
-
+/// Close a fully-released escrow to reclaim rent.
 #[derive(Accounts)]
 pub struct CloseEscrow<'info> {
     #[account(
@@ -439,40 +529,10 @@ pub struct CloseEscrow<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-#[derive(Accounts)]
-pub struct MarkJobCompleted<'info> {
-    #[account(
-        seeds = [b"config_v2"],
-        bump = config.bump
-    )]
-    pub config: Account<'info, GlobalConfig>,
+// ─────────────────────────────────────────────────────────────────────────────
+// EVENTS
+// ─────────────────────────────────────────────────────────────────────────────
 
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"escrow", escrow.user.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, Escrow>,
-}
-
-impl<'info> LockPayment<'info> {
-    pub fn transfer_ctx(&self) -> CpiContext<'_, '_, '_, 'info, TransferChecked<'info>> {
-        CpiContext::new(
-            self.token_program.to_account_info(),
-            TransferChecked {
-                from: self.user_token_account.to_account_info(),
-                to: self.escrow_token_account.to_account_info(),
-                authority: self.user.to_account_info(),
-                mint: self.mint.to_account_info(),
-            },
-        )
-    }
-}
-
-/// Event: Payment locked
 #[event]
 pub struct PaymentLocked {
     pub job_id: u64,
@@ -481,7 +541,6 @@ pub struct PaymentLocked {
     pub amount: u64,
 }
 
-/// Event: Payment released
 #[event]
 pub struct PaymentReleased {
     pub job_id: u64,
@@ -489,16 +548,9 @@ pub struct PaymentReleased {
     pub amount: u64,
 }
 
-/// Event: Job cancelled
 #[event]
 pub struct JobCancelled {
     pub job_id: u64,
     pub user: Pubkey,
     pub refund_amount: u64,
 }
-
-
-
-/// Placeholder Context
-#[derive(Accounts)]
-pub struct Placeholder {}
