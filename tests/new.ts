@@ -32,6 +32,10 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
   let userDepositAta: PublicKey;
   let configPda: PublicKey;
 
+  // Persistent User Identity for the test session
+  const testUserId = Keypair.generate().publicKey;
+
+
   // JobId1 is used for the main batch-release flow
   // JobId2 is used for the cancel flow
   const jobId1 = new anchor.BN(Math.floor(Math.random() * 900_000) + 1);
@@ -69,9 +73,9 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
     console.log("🪙 Test Token Mint Address:", mint.toString());
     console.log(`🔗 View Token on Explorer: https://explorer.solana.com/address/${mint.toString()}?cluster=${cluster}`);
 
-    // 2. Derive Credit PDA addresses
+    // 2. Derive Credit PDA addresses (Using Identity Seed)
     [userAccountPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("user_account"), payer.publicKey.toBuffer()],
+      [Buffer.from("user_account"), testUserId.toBuffer()],
       program.programId
     );
     userDepositAta = getAssociatedTokenAddressSync(mint, userAccountPda, true);
@@ -110,7 +114,8 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
   // (Account is created on first deposit. User pays rent.)
   // ─────────────────────────────────────────────────────────────
   it("Deposit tokens into Website Credit Account", async () => {
-    const tx = await program.methods.depositToAccount(depositAmount).accounts({
+    const tx = await program.methods.depositToAccount(testUserId, depositAmount).accounts({
+
       userAccount:             userAccountPda,
       user:                    payer.publicKey,
       mint,
@@ -137,12 +142,14 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
   // ─────────────────────────────────────────────────────────────
   it("Locks tokens for a specific job (from Credits)", async () => {
     const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("escrow"), testUserId.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
       program.programId
     );
+
     const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
-    const tx = await program.methods.lockPayment(jobId1, lockAmount).accounts({
+    const tx = await program.methods.lockPayment(testUserId, jobId1, lockAmount).accounts({
+
       escrow:                  escrowPda,
       user:                    payer.publicKey,
       userDepositAccount:      userAccountPda,
@@ -174,11 +181,12 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
   it("Fails if jobId is different (PDA seed mismatch)", async () => {
     const wrongJobId = new anchor.BN(999_999_999);
     const [wrongEscrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), payer.publicKey.toBuffer(), wrongJobId.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("escrow"), testUserId.toBuffer(), wrongJobId.toArrayLike(Buffer, "le", 8)],
       program.programId
     );
     try {
-      await program.methods.lockPayment(jobId1, lockAmount).accountsPartial({
+      await program.methods.lockPayment(testUserId, jobId1, lockAmount).accountsPartial({
+
         escrow: wrongEscrowPda,
         user:   payer.publicKey,
         mint,
@@ -203,9 +211,10 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
     ), [payer]);
 
     const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("escrow"), testUserId.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
       program.programId
     );
+
     const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
     // Mark completed
@@ -257,9 +266,10 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
     ), [payer]);
 
     const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("escrow"), testUserId.toBuffer(), jobId1.toArrayLike(Buffer, "le", 8)],
       program.programId
     );
+
     const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
     // Release the remaining 2M to fully drain escrow
@@ -294,13 +304,15 @@ describe("Render Network - User Credit Escrow (Full Suite)", () => {
   // ─────────────────────────────────────────────────────────────
   it("Cancels a job and refunds to Credit Account", async () => {
     const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), payer.publicKey.toBuffer(), jobId2.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("escrow"), testUserId.toBuffer(), jobId2.toArrayLike(Buffer, "le", 8)],
       program.programId
     );
+
     const escrowAta = getAssociatedTokenAddressSync(mint, escrowPda, true);
 
     // Lock Job 2
-    await program.methods.lockPayment(jobId2, cancelAmount).accounts({
+    await program.methods.lockPayment(testUserId, jobId2, cancelAmount).accounts({
+
       escrow:                  escrowPda,
       user:                    payer.publicKey,
       userDepositAccount:      userAccountPda,

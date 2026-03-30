@@ -40,18 +40,22 @@ pub mod render_network {
     // Gas fee is paid by the user as part of the transaction.
     // ─────────────────────────────────────────────────────────────
 
-    pub fn deposit_to_account(ctx: Context<DepositToAccount>, amount: u64) -> Result<()> {
+
+    pub fn deposit_to_account(ctx: Context<DepositToAccount>, user_id: Pubkey, amount: u64) -> Result<()> {
+
         require!(amount > 0, NetworkError::InvalidAmount);
 
         let user_account = &mut ctx.accounts.user_account;
 
         // Initialize on first deposit
         if user_account.owner == Pubkey::default() {
-            user_account.owner = ctx.accounts.user.key();
-            user_account.mint  = ctx.accounts.mint.key();
+            user_account.owner   = ctx.accounts.user.key();
+            user_account.user_id = user_id;
+            user_account.mint    = ctx.accounts.mint.key();
             user_account.credited_amount = 0;
-            user_account.bump  = ctx.bumps.user_account;
+            user_account.bump    = ctx.bumps.user_account;
         }
+
 
         // Verify mint matches
         require!(user_account.mint == ctx.accounts.mint.key(), NetworkError::MintMismatch);
@@ -82,7 +86,9 @@ pub mod render_network {
     // USER: Lock payment from Credit Account → Escrow PDA (Job Start)
     // ─────────────────────────────────────────────────────────────
 
-    pub fn lock_payment(ctx: Context<LockPayment>, job_id: u64, amount: u64) -> Result<()> {
+
+    pub fn lock_payment(ctx: Context<LockPayment>, user_id: Pubkey, job_id: u64, amount: u64) -> Result<()> {
+
         require!(amount > 0, NetworkError::InvalidAmount);
 
         // Verify sufficient credits
@@ -93,6 +99,7 @@ pub mod render_network {
         // Initialize Escrow
         let escrow = &mut ctx.accounts.escrow;
         escrow.job_id           = job_id;
+        escrow.user_id          = user_id;
         escrow.user             = ctx.accounts.user.key();
         escrow.mint             = ctx.accounts.mint.key();
         escrow.amount           = amount;
@@ -102,15 +109,17 @@ pub mod render_network {
         escrow.status           = EscrowStatus::Locked as u8;
         escrow.bump             = ctx.bumps.escrow;
 
+
         // Transfer: User Credit PDA ATA → Escrow PDA ATA
         // Signed by the UserAccount PDA
-        let owner_key = user_account.owner;
         let bump = user_account.bump;
+
         let seeds = &[
             b"user_account",
-            owner_key.as_ref(),
+            user_account.user_id.as_ref(), // Use the stored user_id for signing
             &[bump],
         ];
+
         let signer = &[&seeds[..]];
 
         token_interface::transfer_checked(
@@ -191,7 +200,8 @@ pub mod render_network {
                 total_job_payout = total_job_payout.checked_add(payout.amount).ok_or(NetworkError::Overflow)?;
                 require!(total_job_payout <= escrow.remaining_amount, NetworkError::InsufficientEscrowBalance);
 
-                let seeds  = &[b"escrow", escrow.user.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
+                let seeds  = &[b"escrow", escrow.user_id.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
+
                 let signer = &[&seeds[..]];
 
                 token_interface::transfer_checked(
@@ -234,7 +244,7 @@ pub mod render_network {
         let refund_amount = escrow.remaining_amount;
         require!(refund_amount > 0, NetworkError::NoFundsToRefund);
 
-        let seeds  = &[b"escrow", escrow.user.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
+        let seeds  = &[b"escrow", escrow.user_id.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
         let signer = &[&seeds[..]];
 
         // Transfer: Escrow PDA ATA → User Credit PDA ATA
@@ -284,7 +294,8 @@ pub mod render_network {
 
     pub fn close_escrow(ctx: Context<CloseEscrow>) -> Result<()> {
         let escrow = &ctx.accounts.escrow;
-        let seeds  = &[b"escrow", escrow.user.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
+        let seeds  = &[b"escrow", escrow.user_id.as_ref(), &escrow.job_id.to_le_bytes(), &[escrow.bump]];
+
         let signer = &[&seeds[..]];
 
         token_interface::close_account(
@@ -344,15 +355,18 @@ pub struct UpdateConfig<'info> {
 /// On first call: creates the UserAccount PDA and its ATA.
 /// User pays all rent (no platform cost).
 #[derive(Accounts)]
+#[instruction(user_id: Pubkey, amount: u64)]
 pub struct DepositToAccount<'info> {
+
     #[account(
         init_if_needed,
         payer = user,
         space = 8 + UserAccount::INIT_SPACE,
-        seeds = [b"user_account", user.key().as_ref()],
+        seeds = [b"user_account", user_id.as_ref()],
         bump
     )]
     pub user_account: Box<Account<'info, UserAccount>>,
+
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -383,13 +397,13 @@ pub struct DepositToAccount<'info> {
 
 /// User starts a job: moves tokens from their Credit Account → Job Escrow.
 #[derive(Accounts)]
-#[instruction(job_id: u64, amount: u64)]
+#[instruction(user_id: Pubkey, job_id: u64, amount: u64)]
 pub struct LockPayment<'info> {
     #[account(
         init,
         payer = user,
         space = 8 + Escrow::INIT_SPACE,
-        seeds = [b"escrow", user.key().as_ref(), job_id.to_le_bytes().as_ref()],
+        seeds = [b"escrow", user_id.as_ref(), job_id.to_le_bytes().as_ref()],
         bump
     )]
     pub escrow: Box<Account<'info, Escrow>>,
@@ -400,11 +414,11 @@ pub struct LockPayment<'info> {
     /// The user's Credit Account (source of funds)
     #[account(
         mut,
-        seeds = [b"user_account", user.key().as_ref()],
+        seeds = [b"user_account", user_id.as_ref()],
         bump = user_deposit_account.bump,
-        constraint = user_deposit_account.owner == user.key() @ NetworkError::Unauthorized,
     )]
     pub user_deposit_account: Box<Account<'info, UserAccount>>,
+
 
     pub mint: Box<InterfaceAccount<'info, Mint>>,
 
@@ -438,10 +452,11 @@ pub struct MarkJobCompleted<'info> {
     pub admin: Signer<'info>,
     #[account(
         mut,
-        seeds = [b"escrow", escrow.user.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
+        seeds = [b"escrow", escrow.user_id.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
         bump = escrow.bump,
     )]
     pub escrow: Account<'info, Escrow>,
+
 }
 
 #[derive(Accounts)]
@@ -459,23 +474,24 @@ pub struct BatchRelease<'info> {
 pub struct CancelJob<'info> {
     #[account(
         mut,
-        seeds = [b"escrow", user.key().as_ref(), escrow.job_id.to_le_bytes().as_ref()],
+        seeds = [b"escrow", escrow.user_id.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
         bump = escrow.bump,
-        has_one = user,
         has_one = mint,
         close = user,
     )]
     pub escrow: Box<Account<'info, Escrow>>,
+
 
     #[account(mut)]
     pub user: Signer<'info>,
 
     #[account(
         mut,
-        seeds = [b"user_account", user.key().as_ref()],
+        seeds = [b"user_account", escrow.user_id.as_ref()],
         bump = user_deposit_account.bump,
     )]
     pub user_deposit_account: Box<Account<'info, UserAccount>>,
+
 
     pub mint: Box<InterfaceAccount<'info, Mint>>,
 
@@ -505,14 +521,14 @@ pub struct CancelJob<'info> {
 pub struct CloseEscrow<'info> {
     #[account(
         mut,
-        seeds = [b"escrow", user.key().as_ref(), escrow.job_id.to_le_bytes().as_ref()],
+        seeds = [b"escrow", escrow.user_id.as_ref(), escrow.job_id.to_le_bytes().as_ref()],
         bump = escrow.bump,
-        has_one = user,
         has_one = mint,
         constraint = escrow.remaining_amount == 0 @ NetworkError::JobNotFinished,
         close = user,
     )]
     pub escrow: Account<'info, Escrow>,
+
 
     #[account(mut)]
     pub user: Signer<'info>,
