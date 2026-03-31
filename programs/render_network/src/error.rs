@@ -10,8 +10,8 @@ pub enum NetworkError {
     JobIdMismatch,
     #[msg("Invalid escrow status")]
     InvalidStatus,
-    #[msg("Insufficient balance in escrow")]
-    InsufficientEscrowBalance,
+    #[msg("Insufficient balance in user account")]
+    InsufficientFunds,
     #[msg("Arithmetic overflow")]
     Overflow,
     #[msg("Arithmetic underflow")]
@@ -20,8 +20,6 @@ pub enum NetworkError {
     NoFundsToRefund,
     #[msg("Mint mismatch")]
     MintMismatch,
-    #[msg("Job not yet finished or refunded")]
-    JobNotFinished,
-    #[msg("Release delay period has not yet passed")]
-    ReleaseDelayNotMet,
+    #[msg("Replay protection: Job ID must be monotonically increasing")]
+    ReplayProtection,
 }
