@@ -26,7 +26,7 @@ pub struct GlobalConfig {
 }
 
 pub const CONFIG_SEED: &[u8] = b"config_v3"; // BUMPED VERSION
-pub const USER_ACCOUNT_SEED: &[u8] = b"user_account";
+pub const USER_ACCOUNT_SEED: &[u8] = b"user_account_v2";
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct Payout {

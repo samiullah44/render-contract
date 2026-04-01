@@ -190,6 +190,22 @@ pub mod render_network {
 
         Ok(())
     }
+
+    pub fn admin_cancel_payment(ctx: Context<AdminLockPayment>, job_id: u64, amount: u64) -> Result<()> {
+        require!(amount > 0, NetworkError::InvalidAmount);
+        let user_account = &mut ctx.accounts.user_account;
+        
+        require!(user_account.locked_amount >= amount, NetworkError::Underflow);
+        user_account.locked_amount = user_account.locked_amount.checked_sub(amount).ok_or(NetworkError::Underflow)?;
+        
+        emit!(JobUnlocked {
+            job_id,
+            user: user_account.owner,
+            amount
+        });
+        
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +254,7 @@ pub struct DepositToAccount<'info> {
         payer = user,
         space = 8 + UserAccount::INIT_SPACE,
         seeds = [USER_ACCOUNT_SEED, user_id.as_ref()],
-        bump
+        bump,
     )]
     pub user_account: Box<Account<'info, UserAccount>>,
     #[account(mut)]
@@ -282,7 +298,7 @@ pub struct AdminLockPayment<'info> {
 
 #[derive(Accounts)]
 pub struct BatchRelease<'info> {
-    #[account(seeds = [b"config_v3"], bump)]
+    #[account(seeds = [CONFIG_SEED], bump)]
     pub config: Account<'info, GlobalConfig>,
     #[account(mut, constraint = config.admin == admin.key() @ NetworkError::Unauthorized)]
     pub admin: Signer<'info>,
@@ -311,6 +327,13 @@ pub struct BatchRelease<'info> {
 // ─────────────────────────────────────────────────────────────────────────────
 // EVENTS
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[event]
+pub struct JobUnlocked {
+    pub job_id: u64,
+    pub user: Pubkey,
+    pub amount: u64,
+}
 
 #[event]
 pub struct JobLocked {

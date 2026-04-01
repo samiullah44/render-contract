@@ -42,13 +42,14 @@ describe("Render Network - Logical Escrow (Verification)", () => {
   before(async () => {
     // 1. Initialize Global Config (2% fee)
     [configPda] = PublicKey.findProgramAddressSync([Buffer.from("config_v3")], program.programId);
-    feeCollector = Keypair.generate();
-
     try {
-      await program.account.globalConfig.fetch(configPda);
+      const configAcc = await program.account.globalConfig.fetch(configPda);
       console.log("ℹ️ Global Config already exists");
+      // Use the fee collector already stored on-chain
+      feeCollector = { publicKey: configAcc.feeCollector } as any;
     } catch (e) {
       console.log("🚀 Initializing Global Config (2% Fee)...");
+      feeCollector = Keypair.generate();
       try {
           const tx = await program.methods
             .initializeGlobalConfig(new anchor.BN(200)) // 2% fee
@@ -62,7 +63,6 @@ describe("Render Network - Logical Escrow (Verification)", () => {
           console.log(`✅ Config Initialized! TX: ${tx}`);
       } catch (initErr) {
           console.log(`ℹ️ Initialization result: ${initErr.message}`);
-          // Fallback if another test initialized it simultaneously
       }
     }
 
@@ -79,7 +79,7 @@ describe("Render Network - Logical Escrow (Verification)", () => {
 
     // 3. Derive User PDA
     [userAccountPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("user_account"), testUserId.toBuffer()],
+      [Buffer.from("user_account_v2"), testUserId.toBuffer()],
       program.programId
     );
     userDepositAta = getAssociatedTokenAddressSync(mint, userAccountPda, true);
@@ -135,6 +135,22 @@ describe("Render Network - Logical Escrow (Verification)", () => {
     }
   });
 
+  it("Step 3b: Admin Cancel/Unlock Payment", async () => {
+    const unlockAmount = new anchor.BN(2_000_000); // 2 tokens
+    const accBefore = await program.account.userAccount.fetch(userAccountPda);
+    const initialLocked = accBefore.lockedAmount;
+
+    await program.methods.adminCancelPayment(new anchor.BN(100), unlockAmount).accounts({
+      config: configPda,
+      admin: payer.publicKey,
+      userAccount: userAccountPda,
+    }).rpc();
+
+    const accAfter = await program.account.userAccount.fetch(userAccountPda);
+    expect(accAfter.lockedAmount.toNumber()).to.equal(initialLocked.toNumber() - unlockAmount.toNumber());
+    console.log(`✅ Admin successfully unlocked ${unlockAmount.toNumber()} (Current Locked: ${accAfter.lockedAmount.toNumber()})`);
+  });
+
   it("Step 4: Batch Payout with 2% Platform Fee", async () => {
     providerA = Keypair.generate();
     providerB = Keypair.generate();
@@ -181,8 +197,8 @@ describe("Render Network - Logical Escrow (Verification)", () => {
     const acc = await program.account.userAccount.fetch(userAccountPda);
     // Initial 10M - 3M = 7M
     expect(acc.creditedAmount.toNumber()).to.equal(7_000_000);
-    // Locked 5M - 3M = 2M
-    expect(acc.lockedAmount.toNumber()).to.equal(2_000_000);
+    // Locked 3M (after Step 3b) - 3M (paid now) = 0
+    expect(acc.lockedAmount.toNumber()).to.equal(0);
 
     console.log(`✅ Batch Payout Success!`);
     console.log(`💰 Platform Fee (2%) Collected: ${balFee.value.uiAmount} tokens`);
