@@ -206,6 +206,48 @@ pub mod render_network {
         
         Ok(())
     }
+
+    pub fn withdraw_from_account(ctx: Context<WithdrawFromAccount>, amount: u64) -> Result<()> {
+        require!(amount > 0, NetworkError::InvalidAmount);
+        let user_account = &mut ctx.accounts.user_account;
+        
+        let available_balance = user_account.credited_amount.checked_sub(user_account.locked_amount).ok_or(NetworkError::Underflow)?;
+        require!(available_balance >= amount, NetworkError::InsufficientWithdrawableBalance);
+        
+        let user_id = user_account.user_id;
+        let bump = user_account.bump;
+        let seeds = &[
+            USER_ACCOUNT_SEED,
+            user_id.as_ref(),
+            &[bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from:      ctx.accounts.user_deposit_token_account.to_account_info(),
+                    to:        ctx.accounts.user_token_account.to_account_info(),
+                    authority: user_account.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
+                },
+                signer,
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        user_account.credited_amount = user_account.credited_amount.checked_sub(amount).ok_or(NetworkError::Underflow)?;
+
+        emit!(TokensWithdrawn {
+            user: ctx.accounts.user.key(),
+            amount
+        });
+        
+        msg!("Withdrew {} tokens to wallet. New credit balance: {}", amount, user_account.credited_amount);
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -324,6 +366,36 @@ pub struct BatchRelease<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+pub struct WithdrawFromAccount<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [USER_ACCOUNT_SEED, user_account.user_id.as_ref()],
+        bump = user_account.bump,
+        constraint = user_account.owner == user.key() @ NetworkError::Unauthorized
+    )]
+    pub user_account: Account<'info, UserAccount>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = mint,
+        associated_token::authority = user,
+    )]
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = user_account,
+    )]
+    pub user_deposit_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EVENTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,4 +428,10 @@ pub struct BatchPaid {
     pub total_payout: u64,
     pub fee_collected: u64,
     pub timestamp: i64,
+}
+
+#[event]
+pub struct TokensWithdrawn {
+    pub user: Pubkey,
+    pub amount: u64,
 }

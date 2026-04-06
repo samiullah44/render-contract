@@ -22,4 +22,6 @@ pub enum NetworkError {
     MintMismatch,
     #[msg("Replay protection: Job ID must be monotonically increasing")]
     ReplayProtection,
+    #[msg("Insufficient withdrawable balance")]
+    InsufficientWithdrawableBalance,
 }
