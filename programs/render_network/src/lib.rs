@@ -70,7 +70,6 @@ pub mod render_network {
         user_account.credited_amount = user_account.credited_amount
             .checked_add(amount).ok_or(NetworkError::Overflow)?;
 
-        msg!("Deposited {} tokens to credit account. New balance: {}", amount, user_account.credited_amount);
         Ok(())
     }
 
@@ -245,7 +244,6 @@ pub mod render_network {
             amount
         });
         
-        msg!("Withdrew {} tokens to wallet. New credit balance: {}", amount, user_account.credited_amount);
         Ok(())
     }
 }
